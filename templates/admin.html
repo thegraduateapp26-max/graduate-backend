@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <title>Employer Dashboard</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 40px; }
+    input, textarea { width: 100%; padding: 8px; margin: 8px 0; }
+    button { padding: 10px 16px; cursor: pointer; }
+    .box { border: 1px solid #ddd; padding: 20px; border-radius: 8px; max-width: 700px; }
+    .result { margin-top: 16px; font-family: monospace; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+
+<h1>Employer Dashboard</h1>
+
+<div class="box">
+  <h3>Paste JWT Token</h3>
+  <input id="token" placeholder="Paste token from /api/login" />
+</div>
+
+<br>
+
+<div class="box">
+  <h3>Post a Job</h3>
+
+  <input id="title" placeholder="Job Title">
+  <input id="company" placeholder="Company Name">
+  <input id="location" placeholder="Location">
+  <input id="salary" placeholder="Salary Range">
+  <input id="jobType" placeholder="Job Type">
+  <input id="url" placeholder="Application URL">
+
+  <textarea id="description" placeholder="Job Description"></textarea>
+  <input id="tags" placeholder="tags (comma separated)">
+
+  <button onclick="postJob()">Post Job</button>
+
+  <div class="result" id="result"></div>
+</div>
+
+<script>
+async function postJob() {
+
+  const token = document.getElementById("token").value;
+
+  const job = {
+    title: document.getElementById("title").value,
+    company: document.getElementById("company").value,
+    location: document.getElementById("location").value,
+    salaryRange: document.getElementById("salary").value,
+    jobType: document.getElementById("jobType").value,
+    description: document.getElementById("description").value,
+    url: document.getElementById("url").value,
+    tags: document.getElementById("tags").value.split(",")
+  };
+
+  const response = await fetch("/api/jobs", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": "Bearer " + token
+    },
+    body: JSON.stringify(job)
+  });
+
+  const result = await response.json();
+
+  document.getElementById("result").innerText =
+    JSON.stringify(result, null, 2);
+}
+</script>
+
+</body>
+</html>

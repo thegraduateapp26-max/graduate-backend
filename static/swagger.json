@@ -1,0 +1,50 @@
+{
+  "swagger": "2.0",
+  "info": {
+    "title": "Graduate API",
+    "description": "API for jobs and scholarships",
+    "version": "1.0.0"
+  },
+  "basePath": "/",
+  "schemes": ["https"],
+  "paths": {
+    "/api/status": {
+      "get": {
+        "summary": "Check API health",
+        "responses": {
+          "200": {
+            "description": "API is running"
+          }
+        }
+      }
+    },
+    "/api/jobs": {
+      "get": {
+        "summary": "Get all jobs",
+        "responses": {
+          "200": {
+            "description": "List of jobs"
+          }
+        }
+      },
+      "post": {
+        "summary": "Create a job",
+        "responses": {
+          "200": {
+            "description": "Job created"
+          }
+        }
+      }
+    },
+    "/api/scholarships": {
+      "get": {
+        "summary": "Get scholarships",
+        "responses": {
+          "200": {
+            "description": "List of scholarships"
+          }
+        }
+      }
+    }
+  }
+}
