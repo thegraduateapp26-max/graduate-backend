@@ -456,7 +456,7 @@ def my_applications():
     cur = conn.cursor()
 
     cur.execute("""
-        SELECT a.id, a.status, a.created_at,
+        SELECT a.id, a.job_id, a.status, a.created_at,
                j.title, j.company, j.location, j.job_type
         FROM applications a
         JOIN jobs j ON a.job_id = j.id
@@ -470,6 +470,7 @@ def my_applications():
 
     return jsonify([{
         "id": str(r['id']),
+        "jobId": str(r['job_id']),
         "status": r['status'],
         "appliedAt": r['created_at'].isoformat(),
         "job": {
