@@ -2,12 +2,11 @@ import os
 import datetime
 import bcrypt
 import jwt
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 from flask import Flask, jsonify, request, render_template
 from flask_cors import CORS
-import google.auth
-from google.cloud import secretmanager
-from google.cloud.sql.connector import Connector
 from flask_swagger_ui import get_swaggerui_blueprint
 
 
@@ -31,39 +30,95 @@ def handle_preflight():
         response.status_code = 200
         return response
 
-connector = Connector()
-
 JWT_SECRET = os.environ.get("JWT_SECRET", "super-secret-key")
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
 
 # -----------------------------
-# Helpers
+# Database Connection
 # -----------------------------
-def get_project_id():
-    pid = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCP_PROJECT")
-    if pid:
-        return pid
-    _, pid = google.auth.default()
-    return pid
-
-
-def get_db_password():
-    project_id = get_project_id()
-    secret_name = os.environ.get("DB_PASSWORD_SECRET_NAME", "web-app-db-secret")
-    client = secretmanager.SecretManagerServiceClient()
-    secret_path = f"projects/{project_id}/secrets/{secret_name}/versions/latest"
-    response = client.access_secret_version(request={"name": secret_path})
-    return response.payload.data.decode("utf-8")
-
-
 def get_conn():
-    return connector.connect(
-        os.environ["CLOUD_SQL_DATABASE_CONNECTION_NAME"],
-        "pg8000",
-        user=os.environ.get("CLOUD_SQL_DATABASE_USER", "postgres"),
-        password=get_db_password(),
-        db=os.environ.get("CLOUD_SQL_DATABASE_NAME", "postgres"),
-    )
+    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+
+
+# -----------------------------
+# Database Setup (create tables if they don't exist)
+# -----------------------------
+def init_db():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            name TEXT NOT NULL,
+            email TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            role TEXT DEFAULT 'graduate',
+            verification_status TEXT DEFAULT 'pending',
+            headline TEXT,
+            school TEXT,
+            major TEXT,
+            location TEXT,
+            avatar_url TEXT,
+            skills TEXT[],
+            created_at TIMESTAMP DEFAULT NOW()
+        );
+
+        CREATE TABLE IF NOT EXISTS jobs (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            title TEXT NOT NULL,
+            company TEXT NOT NULL,
+            location TEXT,
+            salary_range TEXT,
+            job_type TEXT,
+            description TEXT,
+            url TEXT,
+            tags TEXT[],
+            created_at TIMESTAMP DEFAULT NOW(),
+            is_active BOOLEAN DEFAULT TRUE,
+            posted_by UUID REFERENCES users(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS scholarships (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            title TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            amount TEXT,
+            deadline DATE,
+            description TEXT,
+            url TEXT,
+            tags TEXT[],
+            created_at TIMESTAMP DEFAULT NOW(),
+            is_active BOOLEAN DEFAULT TRUE
+        );
+
+        CREATE TABLE IF NOT EXISTS verification_requests (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            user_id UUID REFERENCES users(id),
+            status TEXT DEFAULT 'pending',
+            created_at TIMESTAMP DEFAULT NOW()
+        );
+
+        CREATE TABLE IF NOT EXISTS applications (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            user_id UUID REFERENCES users(id),
+            job_id UUID REFERENCES jobs(id),
+            status TEXT DEFAULT 'pending',
+            created_at TIMESTAMP DEFAULT NOW(),
+            UNIQUE(user_id, job_id)
+        );
+    """)
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+# Init DB on startup
+try:
+    init_db()
+    print("Database initialized successfully")
+except Exception as e:
+    print(f"Database init error: {e}")
 
 
 # -----------------------------
@@ -90,14 +145,6 @@ def get_current_user():
 @app.get("/")
 def home():
     return "Graduate API running."
-
-
-# -----------------------------
-# Admin Dashboard
-# -----------------------------
-@app.get("/admin")
-def admin():
-    return render_template("admin.html")
 
 
 # -----------------------------
@@ -139,11 +186,12 @@ def signup():
     try:
         cur.execute("""
             INSERT INTO users (name, email, password_hash, role, verification_status)
-            VALUES (%s,%s,%s,%s,'pending')
+            VALUES (%s, %s, %s, %s, 'pending')
             RETURNING id;
         """, (name, email, password_hash, role))
 
-        user_id = cur.fetchone()[0]
+        result = cur.fetchone()
+        user_id = result['id']
         conn.commit()
         return jsonify({"status": "account created", "user_id": str(user_id)})
 
@@ -176,24 +224,19 @@ def login():
     if not user:
         return jsonify({"error": "invalid credentials"}), 401
 
-    user_id = user[0]
-    password_hash = user[1]
-    name = user[2]
-    role = user[3]
-
-    if not bcrypt.checkpw(password.encode("utf-8"), password_hash.encode("utf-8")):
+    if not bcrypt.checkpw(password.encode("utf-8"), user['password_hash'].encode("utf-8")):
         return jsonify({"error": "invalid credentials"}), 401
 
     token = jwt.encode({
-        "user_id": str(user_id),
-        "exp": datetime.datetime.utcnow() + datetime.timedelta(days=1)
+        "user_id": str(user['id']),
+        "exp": datetime.datetime.utcnow() + datetime.timedelta(days=7)
     }, JWT_SECRET, algorithm="HS256")
 
     return jsonify({
         "token": token,
-        "user_id": str(user_id),
-        "name": name,
-        "role": role,
+        "user_id": str(user['id']),
+        "name": user['name'],
+        "role": user['role'],
     })
 
 
@@ -206,7 +249,8 @@ def list_users():
     cur = conn.cursor()
 
     cur.execute("""
-        SELECT id, name, role, verification_status, created_at
+        SELECT id, name, role, verification_status, headline, school,
+        major, location, avatar_url, skills, created_at
         FROM users
         ORDER BY created_at DESC
         LIMIT 100
@@ -219,14 +263,68 @@ def list_users():
     users = []
     for r in rows:
         users.append({
-            "id": str(r[0]),
-            "name": r[1],
-            "role": r[2],
-            "verificationStatus": r[3],
-            "createdAt": r[4].isoformat() if r[4] else None,
+            "id": str(r['id']),
+            "name": r['name'],
+            "role": r['role'],
+            "verificationStatus": r['verification_status'],
+            "headline": r['headline'],
+            "school": r['school'],
+            "major": r['major'],
+            "location": r['location'],
+            "avatarUrl": r['avatar_url'],
+            "skills": r['skills'] or [],
+            "createdAt": r['created_at'].isoformat() if r['created_at'] else None,
         })
 
     return jsonify(users)
+
+
+# -----------------------------
+# UPDATE USER PROFILE
+# -----------------------------
+@app.patch("/api/users/<user_id>")
+def update_user(user_id):
+    current_user = get_current_user()
+    if not current_user or current_user != user_id:
+        return jsonify({"error": "unauthorized"}), 401
+
+    data = request.json
+    conn = get_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("""
+            UPDATE users SET
+                name = COALESCE(%s, name),
+                headline = COALESCE(%s, headline),
+                school = COALESCE(%s, school),
+                major = COALESCE(%s, major),
+                location = COALESCE(%s, location),
+                avatar_url = COALESCE(%s, avatar_url),
+                skills = COALESCE(%s, skills)
+            WHERE id = %s
+            RETURNING id, name, role, headline, school, major, location, avatar_url, skills
+        """, (
+            data.get("name"),
+            data.get("headline"),
+            data.get("school"),
+            data.get("major"),
+            data.get("location"),
+            data.get("avatarUrl"),
+            data.get("skills"),
+            user_id
+        ))
+
+        updated = cur.fetchone()
+        conn.commit()
+        return jsonify({"status": "updated", "user": dict(updated)})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    finally:
+        cur.close()
+        conn.close()
 
 
 # -----------------------------
@@ -238,8 +336,8 @@ def list_jobs():
     cur = conn.cursor()
 
     cur.execute("""
-        SELECT id,title,company,location,salary_range,
-        job_type,description,url,tags,created_at,is_active
+        SELECT id, title, company, location, salary_range,
+        job_type, description, url, tags, created_at, is_active
         FROM jobs
         WHERE is_active = TRUE
         ORDER BY created_at DESC
@@ -253,24 +351,24 @@ def list_jobs():
     jobs = []
     for r in rows:
         jobs.append({
-            "id": str(r[0]),
-            "title": r[1],
-            "company": r[2],
-            "location": r[3],
-            "salaryRange": r[4],
-            "jobType": r[5],
-            "description": r[6],
-            "url": r[7],
-            "tags": r[8] or [],
-            "createdAt": r[9].isoformat() if r[9] else None,
-            "isActive": r[10]
+            "id": str(r['id']),
+            "title": r['title'],
+            "company": r['company'],
+            "location": r['location'],
+            "salaryRange": r['salary_range'],
+            "jobType": r['job_type'],
+            "description": r['description'],
+            "url": r['url'],
+            "tags": r['tags'] or [],
+            "createdAt": r['created_at'].isoformat() if r['created_at'] else None,
+            "isActive": r['is_active']
         })
 
     return jsonify(jobs)
 
 
 # -----------------------------
-# CREATE JOB (SECURED)
+# CREATE JOB
 # -----------------------------
 @app.post("/api/jobs")
 def create_job():
@@ -282,22 +380,105 @@ def create_job():
     conn = get_conn()
     cur = conn.cursor()
 
-    cur.execute("""
-        INSERT INTO jobs (title, company, location, salary_range, job_type, description, url, tags, posted_by)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        RETURNING id
-    """, (
-        data.get("title"), data.get("company"), data.get("location"),
-        data.get("salaryRange"), data.get("jobType"), data.get("description"),
-        data.get("url"), data.get("tags"), user_id
-    ))
+    try:
+        cur.execute("""
+            INSERT INTO jobs (title, company, location, salary_range, job_type, description, url, tags, posted_by)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
+        """, (
+            data.get("title"), data.get("company"), data.get("location"),
+            data.get("salaryRange"), data.get("jobType"), data.get("description"),
+            data.get("url"), data.get("tags"), user_id
+        ))
 
-    job_id = cur.fetchone()[0]
-    conn.commit()
+        result = cur.fetchone()
+        conn.commit()
+        return jsonify({"status": "job created", "job_id": str(result['id'])})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+# -----------------------------
+# APPLY TO JOB
+# -----------------------------
+@app.post("/api/apply")
+def apply_to_job():
+    user_id = get_current_user()
+    if not user_id:
+        return jsonify({"error": "authentication required"}), 401
+
+    data = request.json
+    job_id = data.get("job_id")
+
+    if not job_id:
+        return jsonify({"error": "job_id required"}), 400
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("""
+            INSERT INTO applications (user_id, job_id)
+            VALUES (%s, %s)
+            RETURNING id
+        """, (user_id, job_id))
+
+        result = cur.fetchone()
+        conn.commit()
+        return jsonify({"status": "applied", "application_id": str(result['id'])})
+
+    except psycopg2.errors.UniqueViolation:
+        return jsonify({"error": "already applied"}), 400
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+# -----------------------------
+# MY APPLICATIONS
+# -----------------------------
+@app.get("/api/my-applications")
+def my_applications():
+    user_id = get_current_user()
+    if not user_id:
+        return jsonify({"error": "authentication required"}), 401
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT a.id, a.status, a.created_at,
+               j.title, j.company, j.location, j.job_type
+        FROM applications a
+        JOIN jobs j ON a.job_id = j.id
+        WHERE a.user_id = %s
+        ORDER BY a.created_at DESC
+    """, (user_id,))
+
+    rows = cur.fetchall()
     cur.close()
     conn.close()
 
-    return jsonify({"status": "job created", "job_id": str(job_id)})
+    return jsonify([{
+        "id": str(r['id']),
+        "status": r['status'],
+        "appliedAt": r['created_at'].isoformat(),
+        "job": {
+            "title": r['title'],
+            "company": r['company'],
+            "location": r['location'],
+            "jobType": r['job_type'],
+        }
+    } for r in rows])
 
 
 # -----------------------------
@@ -309,8 +490,8 @@ def list_scholarships():
     cur = conn.cursor()
 
     cur.execute("""
-        SELECT id,title,provider,amount,deadline,
-        description,url,tags,created_at,is_active
+        SELECT id, title, provider, amount, deadline,
+        description, url, tags, created_at, is_active
         FROM scholarships
         WHERE is_active = TRUE
         ORDER BY created_at DESC
@@ -324,23 +505,23 @@ def list_scholarships():
     scholarships = []
     for r in rows:
         scholarships.append({
-            "id": str(r[0]),
-            "title": r[1],
-            "provider": r[2],
-            "amount": r[3],
-            "deadline": r[4].isoformat() if r[4] else None,
-            "description": r[5],
-            "url": r[6],
-            "tags": r[7] or [],
-            "createdAt": r[8].isoformat() if r[8] else None,
-            "isActive": r[9]
+            "id": str(r['id']),
+            "title": r['title'],
+            "provider": r['provider'],
+            "amount": r['amount'],
+            "deadline": r['deadline'].isoformat() if r['deadline'] else None,
+            "description": r['description'],
+            "url": r['url'],
+            "tags": r['tags'] or [],
+            "createdAt": r['created_at'].isoformat() if r['created_at'] else None,
+            "isActive": r['is_active']
         })
 
     return jsonify(scholarships)
 
 
 # -----------------------------
-# CREATE SCHOLARSHIP (SECURED)
+# CREATE SCHOLARSHIP
 # -----------------------------
 @app.post("/api/scholarships")
 def create_scholarship():
@@ -350,10 +531,7 @@ def create_scholarship():
 
     data = request.json
 
-    title = data.get("title")
-    provider = data.get("provider")
-
-    if not title or not provider:
+    if not data.get("title") or not data.get("provider"):
         return jsonify({"error": "title and provider are required"}), 400
 
     conn = get_conn()
@@ -362,21 +540,17 @@ def create_scholarship():
     try:
         cur.execute("""
             INSERT INTO scholarships (title, provider, amount, deadline, description, url, tags, is_active)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,TRUE)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, TRUE)
             RETURNING id
         """, (
-            title,
-            provider,
-            data.get("amount"),
-            data.get("deadline"),
-            data.get("description"),
-            data.get("url"),
-            data.get("tags", []),
+            data.get("title"), data.get("provider"), data.get("amount"),
+            data.get("deadline"), data.get("description"),
+            data.get("url"), data.get("tags", []),
         ))
 
-        scholarship_id = cur.fetchone()[0]
+        result = cur.fetchone()
         conn.commit()
-        return jsonify({"status": "scholarship created", "scholarship_id": str(scholarship_id)})
+        return jsonify({"status": "scholarship created", "scholarship_id": str(result['id'])})
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -387,7 +561,7 @@ def create_scholarship():
 
 
 # -----------------------------
-# DELETE SCHOLARSHIP (SECURED)
+# DELETE SCHOLARSHIP
 # -----------------------------
 @app.delete("/api/scholarships/<scholarship_id>")
 def delete_scholarship(scholarship_id):
@@ -401,7 +575,7 @@ def delete_scholarship(scholarship_id):
     try:
         cur.execute("UPDATE scholarships SET is_active = FALSE WHERE id = %s", (scholarship_id,))
         conn.commit()
-        return jsonify({"status": "scholarship deleted"})
+        return jsonify({"status": "deleted"})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     finally:
