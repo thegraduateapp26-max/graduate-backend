@@ -9,6 +9,8 @@ from flask import Flask, jsonify, request, render_template
 from flask_cors import CORS
 from flask_swagger_ui import get_swaggerui_blueprint
 
+import emails
+
 
 app = Flask(__name__, static_folder="static", static_url_path="/static")
 CORS(app, origins="*", supports_credentials=False)
@@ -108,6 +110,7 @@ def init_db():
             UNIQUE(user_id, job_id)
         );
     """)
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_matches_sent BOOLEAN DEFAULT FALSE;")
     conn.commit()
     cur.close()
     conn.close()
@@ -119,6 +122,69 @@ try:
     print("Database initialized successfully")
 except Exception as e:
     print(f"Database init error: {e}")
+
+
+# -----------------------------
+# Job Matching
+# -----------------------------
+def find_top_job_matches(major, skills, limit=5):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, title, company, location, salary_range, job_type, description, url, tags
+        FROM jobs
+        WHERE is_active = TRUE
+    """)
+    jobs = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    major_words = [w.lower() for w in (major or "").split() if len(w) > 2]
+    skill_set = {s.lower() for s in (skills or [])}
+
+    scored = []
+    for job in jobs:
+        tags = {t.lower() for t in (job['tags'] or [])}
+        haystack = " ".join([
+            job['title'] or "", job['description'] or "", " ".join(job['tags'] or [])
+        ]).lower()
+
+        score = 0
+        score += 2 * len(skill_set & tags)
+        score += sum(1 for s in skill_set if s in haystack)
+        score += 3 * sum(1 for w in major_words if w in haystack)
+
+        if score > 0:
+            scored.append((score, job))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [job for _, job in scored[:limit]]
+
+
+def maybe_send_job_matches(user_id, name, email, major, skills):
+    if not major or not skills:
+        return
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT profile_matches_sent FROM users WHERE id = %s", (user_id,))
+    row = cur.fetchone()
+    if not row or row['profile_matches_sent']:
+        cur.close()
+        conn.close()
+        return
+
+    matches = find_top_job_matches(major, skills)
+    if matches:
+        try:
+            emails.send_job_matches_email(name, email, matches)
+        except Exception as e:
+            print(f"Job matches email error: {e}")
+
+    cur.execute("UPDATE users SET profile_matches_sent = TRUE WHERE id = %s", (user_id,))
+    conn.commit()
+    cur.close()
+    conn.close()
 
 
 # -----------------------------
@@ -193,6 +259,12 @@ def signup():
         result = cur.fetchone()
         user_id = result['id']
         conn.commit()
+
+        try:
+            emails.send_welcome_email(name, email)
+        except Exception as e:
+            print(f"Welcome email error: {e}")
+
         return jsonify({"status": "account created", "user_id": str(user_id)})
 
     except Exception as e:
@@ -303,7 +375,7 @@ def update_user(user_id):
                 avatar_url = COALESCE(%s, avatar_url),
                 skills = COALESCE(%s, skills)
             WHERE id = %s
-            RETURNING id, name, role, headline, school, major, location, avatar_url, skills
+            RETURNING id, name, email, role, headline, school, major, location, avatar_url, skills
         """, (
             data.get("name"),
             data.get("headline"),
@@ -317,7 +389,17 @@ def update_user(user_id):
 
         updated = cur.fetchone()
         conn.commit()
-        return jsonify({"status": "updated", "user": dict(updated)})
+
+        try:
+            maybe_send_job_matches(
+                user_id, updated['name'], updated['email'], updated['major'], updated['skills']
+            )
+        except Exception as e:
+            print(f"Job matching error: {e}")
+
+        result = dict(updated)
+        result.pop('email', None)
+        return jsonify({"status": "updated", "user": result})
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
