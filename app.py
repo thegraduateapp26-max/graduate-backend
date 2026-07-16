@@ -109,6 +109,16 @@ def init_db():
             created_at TIMESTAMP DEFAULT NOW(),
             UNIQUE(user_id, job_id)
         );
+
+        CREATE TABLE IF NOT EXISTS endorsements (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            recipient_id UUID REFERENCES users(id) NOT NULL,
+            author_id UUID REFERENCES users(id) NOT NULL,
+            relationship TEXT DEFAULT 'Professor',
+            text TEXT NOT NULL,
+            visible BOOLEAN DEFAULT TRUE,
+            created_at TIMESTAMP DEFAULT NOW()
+        );
     """)
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_matches_sent BOOLEAN DEFAULT FALSE;")
     conn.commit()
@@ -400,6 +410,137 @@ def update_user(user_id):
         result = dict(updated)
         result.pop('email', None)
         return jsonify({"status": "updated", "user": result})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+# -----------------------------
+# ENDORSEMENTS
+# -----------------------------
+@app.get("/api/users/<user_id>/endorsements")
+def list_endorsements(user_id):
+    current_user = get_current_user()
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    if current_user == user_id:
+        cur.execute("""
+            SELECT e.id, e.relationship, e.text, e.visible, e.created_at,
+                   u.name AS author_name, u.avatar_url AS author_avatar_url
+            FROM endorsements e
+            JOIN users u ON u.id = e.author_id
+            WHERE e.recipient_id = %s
+            ORDER BY e.created_at DESC
+        """, (user_id,))
+    else:
+        cur.execute("""
+            SELECT e.id, e.relationship, e.text, e.visible, e.created_at,
+                   u.name AS author_name, u.avatar_url AS author_avatar_url
+            FROM endorsements e
+            JOIN users u ON u.id = e.author_id
+            WHERE e.recipient_id = %s AND e.visible = TRUE
+            ORDER BY e.created_at DESC
+        """, (user_id,))
+
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    return jsonify([{
+        "id": str(r['id']),
+        "fromName": r['author_name'],
+        "relationship": r['relationship'],
+        "text": r['text'],
+        "avatarUrl": r['author_avatar_url'],
+        "visible": r['visible'],
+    } for r in rows])
+
+
+@app.post("/api/users/<user_id>/endorsements")
+def create_endorsement(user_id):
+    author_id = get_current_user()
+    if not author_id:
+        return jsonify({"error": "authentication required"}), 401
+
+    data = request.json or {}
+    text = (data.get("text") or "").strip()
+    if not text:
+        return jsonify({"error": "text is required"}), 400
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("SELECT role FROM users WHERE id = %s", (author_id,))
+        author = cur.fetchone()
+        if not author or author['role'] != 'professor':
+            return jsonify({"error": "only professors can write endorsements"}), 403
+
+        cur.execute("""
+            INSERT INTO endorsements (recipient_id, author_id, relationship, text, visible)
+            VALUES (%s, %s, %s, %s, TRUE)
+            RETURNING id, relationship, text, visible
+        """, (user_id, author_id, data.get("relationship", "Professor"), text))
+
+        result = cur.fetchone()
+        conn.commit()
+
+        cur.execute("SELECT name, avatar_url FROM users WHERE id = %s", (author_id,))
+        author_info = cur.fetchone()
+
+        return jsonify({
+            "status": "created",
+            "endorsement": {
+                "id": str(result['id']),
+                "fromName": author_info['name'],
+                "relationship": result['relationship'],
+                "text": result['text'],
+                "avatarUrl": author_info['avatar_url'],
+                "visible": result['visible'],
+            }
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.patch("/api/endorsements/<endorsement_id>")
+def update_endorsement(endorsement_id):
+    current_user = get_current_user()
+    if not current_user:
+        return jsonify({"error": "authentication required"}), 401
+
+    data = request.json or {}
+    if "visible" not in data:
+        return jsonify({"error": "visible is required"}), 400
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("""
+            UPDATE endorsements SET visible = %s
+            WHERE id = %s AND recipient_id = %s
+            RETURNING id, visible
+        """, (bool(data.get("visible")), endorsement_id, current_user))
+
+        updated = cur.fetchone()
+        conn.commit()
+
+        if not updated:
+            return jsonify({"error": "not found or unauthorized"}), 404
+
+        return jsonify({"status": "updated", "id": str(updated['id']), "visible": updated['visible']})
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
