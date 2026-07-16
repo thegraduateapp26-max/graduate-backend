@@ -119,6 +119,13 @@ def init_db():
             visible BOOLEAN DEFAULT TRUE,
             created_at TIMESTAMP DEFAULT NOW()
         );
+
+        CREATE TABLE IF NOT EXISTS posts (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            author_id UUID REFERENCES users(id) NOT NULL,
+            content TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT NOW()
+        );
     """)
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_matches_sent BOOLEAN DEFAULT FALSE;")
     conn.commit()
@@ -541,6 +548,84 @@ def update_endorsement(endorsement_id):
             return jsonify({"error": "not found or unauthorized"}), 404
 
         return jsonify({"status": "updated", "id": str(updated['id']), "visible": updated['visible']})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+# -----------------------------
+# FEED POSTS
+# -----------------------------
+@app.get("/api/feed")
+def list_feed_posts():
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT p.id, p.content, p.created_at,
+               u.name AS author_name, u.headline AS author_headline, u.avatar_url AS author_avatar_url
+        FROM posts p
+        JOIN users u ON u.id = p.author_id
+        ORDER BY p.created_at DESC
+        LIMIT 50
+    """)
+
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    return jsonify([{
+        "id": str(r['id']),
+        "authorName": r['author_name'],
+        "authorHeadline": r['author_headline'],
+        "authorAvatarUrl": r['author_avatar_url'],
+        "content": r['content'],
+        "createdAt": r['created_at'].isoformat() if r['created_at'] else None,
+    } for r in rows])
+
+
+@app.post("/api/feed")
+def create_feed_post():
+    author_id = get_current_user()
+    if not author_id:
+        return jsonify({"error": "authentication required"}), 401
+
+    data = request.json or {}
+    content = (data.get("content") or "").strip()
+    if not content:
+        return jsonify({"error": "content is required"}), 400
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("""
+            INSERT INTO posts (author_id, content)
+            VALUES (%s, %s)
+            RETURNING id, content, created_at
+        """, (author_id, content))
+
+        result = cur.fetchone()
+        conn.commit()
+
+        cur.execute("SELECT name, headline, avatar_url FROM users WHERE id = %s", (author_id,))
+        author_info = cur.fetchone()
+
+        return jsonify({
+            "status": "created",
+            "post": {
+                "id": str(result['id']),
+                "authorName": author_info['name'],
+                "authorHeadline": author_info['headline'],
+                "authorAvatarUrl": author_info['avatar_url'],
+                "content": result['content'],
+                "createdAt": result['created_at'].isoformat() if result['created_at'] else None,
+            }
+        })
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
