@@ -466,6 +466,7 @@ def list_endorsements(user_id):
         "text": r['text'],
         "avatarUrl": r['author_avatar_url'],
         "visible": r['visible'],
+        "createdAt": r['created_at'].isoformat() if r['created_at'] else None,
     } for r in rows])
 
 
@@ -492,7 +493,7 @@ def create_endorsement(user_id):
         cur.execute("""
             INSERT INTO endorsements (recipient_id, author_id, relationship, text, visible)
             VALUES (%s, %s, %s, %s, TRUE)
-            RETURNING id, relationship, text, visible
+            RETURNING id, relationship, text, visible, created_at
         """, (user_id, author_id, data.get("relationship", "Professor"), text))
 
         result = cur.fetchone()
@@ -510,6 +511,7 @@ def create_endorsement(user_id):
                 "text": result['text'],
                 "avatarUrl": author_info['avatar_url'],
                 "visible": result['visible'],
+                "createdAt": result['created_at'].isoformat() if result['created_at'] else None,
             }
         })
 
