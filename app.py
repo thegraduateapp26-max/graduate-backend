@@ -13,20 +13,44 @@ import emails
 
 
 app = Flask(__name__, static_folder="static", static_url_path="/static")
-CORS(app, origins="*", supports_credentials=False)
+
+ALLOWED_ORIGINS = {
+    "https://thegraduate.io",
+    "https://www.thegraduate.io",
+    "http://localhost:5173",
+    "http://localhost:3000",
+}
+
+CORS(app, origins=list(ALLOWED_ORIGINS), supports_credentials=False)
+
+
+def _cors_origin():
+    origin = request.headers.get("Origin")
+    return origin if origin in ALLOWED_ORIGINS else None
+
 
 @app.after_request
-def add_cors_headers(response):
-    response.headers['Access-Control-Allow-Origin'] = '*'
+def add_security_headers(response):
+    origin = _cors_origin()
+    if origin:
+        response.headers['Access-Control-Allow-Origin'] = origin
+        response.headers['Vary'] = 'Origin'
     response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
     response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, PATCH, DELETE, OPTIONS'
+    response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
     return response
 
 @app.before_request
 def handle_preflight():
     if request.method == 'OPTIONS':
         response = app.make_response('')
-        response.headers['Access-Control-Allow-Origin'] = '*'
+        origin = _cors_origin()
+        if origin:
+            response.headers['Access-Control-Allow-Origin'] = origin
+            response.headers['Vary'] = 'Origin'
         response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
         response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, PATCH, DELETE, OPTIONS'
         response.status_code = 200
