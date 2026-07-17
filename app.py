@@ -144,6 +144,7 @@ def init_db():
         );
     """)
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_matches_sent BOOLEAN DEFAULT FALSE;")
+    cur.execute("ALTER TABLE post_comments ADD COLUMN IF NOT EXISTS parent_comment_id UUID REFERENCES post_comments(id);")
     conn.commit()
     cur.close()
     conn.close()
