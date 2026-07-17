@@ -238,6 +238,18 @@ def get_current_user():
         return None
 
 
+def is_admin(user_id):
+    if not user_id:
+        return False
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT role FROM users WHERE id = %s", (user_id,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return bool(row and row['role'] == 'admin')
+
+
 # -----------------------------
 # Root
 # -----------------------------
@@ -433,6 +445,46 @@ def update_user(user_id):
         result = dict(updated)
         result.pop('email', None)
         return jsonify({"status": "updated", "user": result})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+# -----------------------------
+# ADMIN: VERIFICATION
+# -----------------------------
+@app.patch("/api/users/<user_id>/verification")
+def update_user_verification(user_id):
+    current_user = get_current_user()
+    if not is_admin(current_user):
+        return jsonify({"error": "unauthorized"}), 401
+
+    data = request.json or {}
+    status = data.get("status")
+    if status not in ("approved", "rejected", "pending"):
+        return jsonify({"error": "status must be approved, rejected, or pending"}), 400
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("""
+            UPDATE users SET verification_status = %s
+            WHERE id = %s
+            RETURNING id, verification_status
+        """, (status, user_id))
+
+        updated = cur.fetchone()
+        conn.commit()
+
+        if not updated:
+            return jsonify({"error": "user not found"}), 404
+
+        return jsonify({"status": "updated", "id": str(updated['id']), "verificationStatus": updated['verification_status']})
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -851,6 +903,43 @@ def create_job():
         result = cur.fetchone()
         conn.commit()
         return jsonify({"status": "job created", "job_id": str(result['id'])})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.patch("/api/jobs/<job_id>")
+def update_job(job_id):
+    user_id = get_current_user()
+    if not user_id:
+        return jsonify({"error": "authentication required"}), 401
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("SELECT posted_by FROM jobs WHERE id = %s", (job_id,))
+        job = cur.fetchone()
+        if not job:
+            return jsonify({"error": "job not found"}), 404
+        if str(job['posted_by']) != user_id and not is_admin(user_id):
+            return jsonify({"error": "unauthorized"}), 401
+
+        data = request.json or {}
+        cur.execute("""
+            UPDATE jobs SET is_active = COALESCE(%s, is_active)
+            WHERE id = %s
+            RETURNING id, is_active
+        """, (data.get("isActive"), job_id))
+
+        updated = cur.fetchone()
+        conn.commit()
+
+        return jsonify({"status": "updated", "id": str(updated['id']), "isActive": updated['is_active']})
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
