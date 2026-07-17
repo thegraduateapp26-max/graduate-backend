@@ -143,6 +143,15 @@ def init_db():
             UNIQUE(requester_id, recipient_id)
         );
 
+        CREATE TABLE IF NOT EXISTS messages (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            sender_id UUID REFERENCES users(id) NOT NULL,
+            recipient_id UUID REFERENCES users(id) NOT NULL,
+            text TEXT NOT NULL,
+            read BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMP DEFAULT NOW()
+        );
+
         CREATE TABLE IF NOT EXISTS endorsements (
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
             recipient_id UUID REFERENCES users(id) NOT NULL,
@@ -670,6 +679,174 @@ def list_incoming_requests():
         "requesterAvatarUrl": r['requester_avatar_url'],
         "createdAt": r['created_at'].isoformat() if r['created_at'] else None,
     } for r in rows])
+
+
+@app.get("/api/users/<user_id>/connections")
+def list_user_connections(user_id):
+    # Private: a user's connection list is only visible to themselves.
+    current_user = get_current_user()
+    if not current_user or current_user != user_id:
+        return jsonify({"error": "unauthorized"}), 401
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT c.id, c.created_at,
+               CASE WHEN c.requester_id = %s THEN c.recipient_id ELSE c.requester_id END AS other_id
+        FROM connections c
+        WHERE c.status = 'accepted' AND (c.requester_id = %s OR c.recipient_id = %s)
+        ORDER BY c.created_at DESC
+    """, (user_id, user_id, user_id))
+    rows = cur.fetchall()
+
+    results = []
+    for r in rows:
+        cur.execute("SELECT id, name, headline, school, avatar_url, role FROM users WHERE id = %s", (r['other_id'],))
+        u = cur.fetchone()
+        if u:
+            results.append({
+                "connectionId": str(r['id']),
+                "userId": str(u['id']),
+                "name": u['name'],
+                "headline": u['headline'],
+                "school": u['school'],
+                "avatarUrl": u['avatar_url'],
+                "role": u['role'],
+                "connectedAt": r['created_at'].isoformat() if r['created_at'] else None,
+            })
+
+    cur.close()
+    conn.close()
+
+    return jsonify(results)
+
+
+# -----------------------------
+# MESSAGES
+# -----------------------------
+@app.get("/api/messages/threads")
+def list_message_threads():
+    current_user = get_current_user()
+    if not current_user:
+        return jsonify({"error": "authentication required"}), 401
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("""
+        WITH convo AS (
+            SELECT
+                CASE WHEN sender_id = %(me)s THEN recipient_id ELSE sender_id END AS other_id,
+                text, created_at,
+                ROW_NUMBER() OVER (
+                    PARTITION BY CASE WHEN sender_id = %(me)s THEN recipient_id ELSE sender_id END
+                    ORDER BY created_at DESC
+                ) AS rn
+            FROM messages
+            WHERE sender_id = %(me)s OR recipient_id = %(me)s
+        )
+        SELECT c.other_id, c.text AS last_message, c.created_at AS last_timestamp,
+               u.name, u.avatar_url,
+               EXISTS(
+                   SELECT 1 FROM messages m2
+                   WHERE m2.sender_id = c.other_id AND m2.recipient_id = %(me)s AND m2.read = FALSE
+               ) AS unread
+        FROM convo c
+        JOIN users u ON u.id = c.other_id
+        WHERE c.rn = 1
+        ORDER BY c.created_at DESC
+    """, {"me": current_user})
+
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    return jsonify([{
+        "participantId": str(r['other_id']),
+        "participantName": r['name'],
+        "participantAvatarUrl": r['avatar_url'],
+        "lastMessage": r['last_message'],
+        "timestamp": r['last_timestamp'].isoformat() if r['last_timestamp'] else None,
+        "unread": r['unread'],
+    } for r in rows])
+
+
+@app.get("/api/messages/<other_user_id>")
+def get_message_thread(other_user_id):
+    current_user = get_current_user()
+    if not current_user:
+        return jsonify({"error": "authentication required"}), 401
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT id, sender_id, recipient_id, text, created_at
+        FROM messages
+        WHERE (sender_id = %s AND recipient_id = %s) OR (sender_id = %s AND recipient_id = %s)
+        ORDER BY created_at ASC
+    """, (current_user, other_user_id, other_user_id, current_user))
+    rows = cur.fetchall()
+
+    # Opening a thread marks the other person's messages to us as read.
+    cur.execute("""
+        UPDATE messages SET read = TRUE
+        WHERE sender_id = %s AND recipient_id = %s AND read = FALSE
+    """, (other_user_id, current_user))
+    conn.commit()
+
+    cur.close()
+    conn.close()
+
+    return jsonify([{
+        "id": str(r['id']),
+        "senderId": str(r['sender_id']),
+        "text": r['text'],
+        "timestamp": r['created_at'].isoformat() if r['created_at'] else None,
+    } for r in rows])
+
+
+@app.post("/api/messages/<other_user_id>")
+def send_message(other_user_id):
+    current_user = get_current_user()
+    if not current_user:
+        return jsonify({"error": "authentication required"}), 401
+
+    data = request.json or {}
+    text = (data.get("text") or "").strip()
+    if not text:
+        return jsonify({"error": "text is required"}), 400
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("""
+            INSERT INTO messages (sender_id, recipient_id, text)
+            VALUES (%s, %s, %s)
+            RETURNING id, created_at
+        """, (current_user, other_user_id, text))
+
+        result = cur.fetchone()
+        conn.commit()
+
+        return jsonify({
+            "status": "sent",
+            "message": {
+                "id": str(result['id']),
+                "senderId": current_user,
+                "text": text,
+                "timestamp": result['created_at'].isoformat() if result['created_at'] else None,
+            }
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    finally:
+        cur.close()
+        conn.close()
 
 
 # -----------------------------
