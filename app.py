@@ -138,6 +138,7 @@ def init_db():
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
             post_id UUID REFERENCES posts(id) NOT NULL,
             author_id UUID REFERENCES users(id) NOT NULL,
+            parent_comment_id UUID REFERENCES post_comments(id),
             text TEXT NOT NULL,
             created_at TIMESTAMP DEFAULT NOW()
         );
@@ -714,7 +715,7 @@ def list_post_comments(post_id):
     cur = conn.cursor()
 
     cur.execute("""
-        SELECT c.id, c.text, c.created_at, u.name AS author_name, u.avatar_url AS author_avatar_url
+        SELECT c.id, c.text, c.created_at, c.parent_comment_id, u.name AS author_name, u.avatar_url AS author_avatar_url
         FROM post_comments c
         JOIN users u ON u.id = c.author_id
         WHERE c.post_id = %s
@@ -731,6 +732,7 @@ def list_post_comments(post_id):
         "authorAvatarUrl": r['author_avatar_url'],
         "text": r['text'],
         "createdAt": r['created_at'].isoformat() if r['created_at'] else None,
+        "parentCommentId": str(r['parent_comment_id']) if r['parent_comment_id'] else None,
     } for r in rows])
 
 
@@ -742,6 +744,7 @@ def create_post_comment(post_id):
 
     data = request.json or {}
     text = (data.get("text") or "").strip()
+    parent_comment_id = data.get("parentCommentId")
     if not text:
         return jsonify({"error": "text is required"}), 400
 
@@ -750,10 +753,10 @@ def create_post_comment(post_id):
 
     try:
         cur.execute("""
-            INSERT INTO post_comments (post_id, author_id, text)
-            VALUES (%s, %s, %s)
-            RETURNING id, text, created_at
-        """, (post_id, author_id, text))
+            INSERT INTO post_comments (post_id, author_id, parent_comment_id, text)
+            VALUES (%s, %s, %s, %s)
+            RETURNING id, text, created_at, parent_comment_id
+        """, (post_id, author_id, parent_comment_id, text))
 
         result = cur.fetchone()
         conn.commit()
@@ -769,6 +772,7 @@ def create_post_comment(post_id):
                 "authorAvatarUrl": author_info['avatar_url'],
                 "text": result['text'],
                 "createdAt": result['created_at'].isoformat() if result['created_at'] else None,
+                "parentCommentId": str(result['parent_comment_id']) if result['parent_comment_id'] else None,
             }
         })
 
