@@ -110,6 +110,15 @@ def init_db():
             UNIQUE(user_id, job_id)
         );
 
+        CREATE TABLE IF NOT EXISTS connections (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            requester_id UUID REFERENCES users(id) NOT NULL,
+            recipient_id UUID REFERENCES users(id) NOT NULL,
+            status TEXT DEFAULT 'pending',
+            created_at TIMESTAMP DEFAULT NOW(),
+            UNIQUE(requester_id, recipient_id)
+        );
+
         CREATE TABLE IF NOT EXISTS endorsements (
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
             recipient_id UUID REFERENCES users(id) NOT NULL,
@@ -493,6 +502,150 @@ def update_user_verification(user_id):
     finally:
         cur.close()
         conn.close()
+
+
+# -----------------------------
+# NETWORK CONNECTIONS
+# -----------------------------
+@app.get("/api/users/<user_id>/connection-status")
+def get_connection_status(user_id):
+    current_user = get_current_user()
+    if not current_user:
+        return jsonify({"status": "none"})
+    if current_user == user_id:
+        return jsonify({"status": "self"})
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT id, requester_id, recipient_id, status FROM connections
+        WHERE (requester_id = %s AND recipient_id = %s) OR (requester_id = %s AND recipient_id = %s)
+    """, (current_user, user_id, user_id, current_user))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+
+    if not row:
+        return jsonify({"status": "none"})
+    if row['status'] == 'accepted':
+        return jsonify({"status": "connected", "connectionId": str(row['id'])})
+    if row['status'] == 'pending':
+        if str(row['requester_id']) == current_user:
+            return jsonify({"status": "pending_sent", "connectionId": str(row['id'])})
+        return jsonify({"status": "pending_received", "connectionId": str(row['id'])})
+    return jsonify({"status": "none"})
+
+
+@app.post("/api/users/<user_id>/connect")
+def request_connection(user_id):
+    current_user = get_current_user()
+    if not current_user:
+        return jsonify({"error": "authentication required"}), 401
+    if current_user == user_id:
+        return jsonify({"error": "cannot connect with yourself"}), 400
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    try:
+        # If the other person already requested us, connecting back accepts their request
+        # instead of creating a conflicting second row.
+        cur.execute("""
+            SELECT id FROM connections
+            WHERE requester_id = %s AND recipient_id = %s AND status = 'pending'
+        """, (user_id, current_user))
+        reverse = cur.fetchone()
+
+        if reverse:
+            cur.execute("UPDATE connections SET status = 'accepted' WHERE id = %s RETURNING id", (reverse['id'],))
+            result = cur.fetchone()
+            conn.commit()
+            return jsonify({"status": "connected", "connectionId": str(result['id'])})
+
+        cur.execute("""
+            INSERT INTO connections (requester_id, recipient_id, status)
+            VALUES (%s, %s, 'pending')
+            ON CONFLICT (requester_id, recipient_id) DO UPDATE SET status = 'pending'
+            RETURNING id
+        """, (current_user, user_id))
+        result = cur.fetchone()
+        conn.commit()
+        return jsonify({"status": "pending_sent", "connectionId": str(result['id'])})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.patch("/api/connections/<connection_id>")
+def respond_to_connection(connection_id):
+    current_user = get_current_user()
+    if not current_user:
+        return jsonify({"error": "authentication required"}), 401
+
+    data = request.json or {}
+    new_status = data.get("status")
+    if new_status not in ("accepted", "declined"):
+        return jsonify({"error": "status must be accepted or declined"}), 400
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("""
+            UPDATE connections SET status = %s
+            WHERE id = %s AND recipient_id = %s AND status = 'pending'
+            RETURNING id, status
+        """, (new_status, connection_id, current_user))
+
+        updated = cur.fetchone()
+        conn.commit()
+
+        if not updated:
+            return jsonify({"error": "not found or unauthorized"}), 404
+
+        return jsonify({"status": "updated", "id": str(updated['id']), "connectionStatus": updated['status']})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.get("/api/connections/requests")
+def list_incoming_requests():
+    current_user = get_current_user()
+    if not current_user:
+        return jsonify({"error": "authentication required"}), 401
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT c.id, c.created_at, u.id AS requester_id, u.name AS requester_name, u.avatar_url AS requester_avatar_url
+        FROM connections c
+        JOIN users u ON u.id = c.requester_id
+        WHERE c.recipient_id = %s AND c.status = 'pending'
+        ORDER BY c.created_at DESC
+    """, (current_user,))
+
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    return jsonify([{
+        "connectionId": str(r['id']),
+        "requesterId": str(r['requester_id']),
+        "requesterName": r['requester_name'],
+        "requesterAvatarUrl": r['requester_avatar_url'],
+        "createdAt": r['created_at'].isoformat() if r['created_at'] else None,
+    } for r in rows])
 
 
 # -----------------------------
