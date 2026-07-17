@@ -126,6 +126,21 @@ def init_db():
             content TEXT NOT NULL,
             created_at TIMESTAMP DEFAULT NOW()
         );
+
+        CREATE TABLE IF NOT EXISTS post_likes (
+            post_id UUID REFERENCES posts(id) NOT NULL,
+            user_id UUID REFERENCES users(id) NOT NULL,
+            created_at TIMESTAMP DEFAULT NOW(),
+            PRIMARY KEY (post_id, user_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS post_comments (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            post_id UUID REFERENCES posts(id) NOT NULL,
+            author_id UUID REFERENCES users(id) NOT NULL,
+            text TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT NOW()
+        );
     """)
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_matches_sent BOOLEAN DEFAULT FALSE;")
     conn.commit()
@@ -564,17 +579,22 @@ def update_endorsement(endorsement_id):
 # -----------------------------
 @app.get("/api/feed")
 def list_feed_posts():
+    current_user = get_current_user()
+
     conn = get_conn()
     cur = conn.cursor()
 
     cur.execute("""
-        SELECT p.id, p.content, p.created_at,
-               u.name AS author_name, u.headline AS author_headline, u.avatar_url AS author_avatar_url
+        SELECT p.id, p.content, p.created_at, u.id AS author_id, u.school AS author_school,
+               u.name AS author_name, u.headline AS author_headline, u.avatar_url AS author_avatar_url,
+               (SELECT COUNT(*) FROM post_likes pl WHERE pl.post_id = p.id) AS likes_count,
+               (SELECT COUNT(*) FROM post_comments pc WHERE pc.post_id = p.id) AS comments_count,
+               EXISTS(SELECT 1 FROM post_likes pl WHERE pl.post_id = p.id AND pl.user_id = %s) AS liked_by_me
         FROM posts p
         JOIN users u ON u.id = p.author_id
         ORDER BY p.created_at DESC
         LIMIT 50
-    """)
+    """, (current_user,))
 
     rows = cur.fetchall()
     cur.close()
@@ -582,11 +602,16 @@ def list_feed_posts():
 
     return jsonify([{
         "id": str(r['id']),
+        "authorId": str(r['author_id']),
+        "authorSchool": r['author_school'],
         "authorName": r['author_name'],
         "authorHeadline": r['author_headline'],
         "authorAvatarUrl": r['author_avatar_url'],
         "content": r['content'],
         "createdAt": r['created_at'].isoformat() if r['created_at'] else None,
+        "likesCount": r['likes_count'],
+        "commentsCount": r['comments_count'],
+        "likedByMe": r['liked_by_me'],
     } for r in rows])
 
 
@@ -614,17 +639,135 @@ def create_feed_post():
         result = cur.fetchone()
         conn.commit()
 
-        cur.execute("SELECT name, headline, avatar_url FROM users WHERE id = %s", (author_id,))
+        cur.execute("SELECT name, headline, avatar_url, school FROM users WHERE id = %s", (author_id,))
         author_info = cur.fetchone()
 
         return jsonify({
             "status": "created",
             "post": {
                 "id": str(result['id']),
+                "authorId": author_id,
+                "authorSchool": author_info['school'],
                 "authorName": author_info['name'],
                 "authorHeadline": author_info['headline'],
                 "authorAvatarUrl": author_info['avatar_url'],
                 "content": result['content'],
+                "createdAt": result['created_at'].isoformat() if result['created_at'] else None,
+                "likesCount": 0,
+                "commentsCount": 0,
+                "likedByMe": False,
+            }
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+# -----------------------------
+# FEED POST LIKES
+# -----------------------------
+@app.post("/api/feed/<post_id>/like")
+def toggle_post_like(post_id):
+    user_id = get_current_user()
+    if not user_id:
+        return jsonify({"error": "authentication required"}), 401
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("SELECT 1 FROM post_likes WHERE post_id = %s AND user_id = %s", (post_id, user_id))
+        already_liked = cur.fetchone()
+
+        if already_liked:
+            cur.execute("DELETE FROM post_likes WHERE post_id = %s AND user_id = %s", (post_id, user_id))
+            liked = False
+        else:
+            cur.execute("INSERT INTO post_likes (post_id, user_id) VALUES (%s, %s)", (post_id, user_id))
+            liked = True
+
+        conn.commit()
+
+        cur.execute("SELECT COUNT(*) AS count FROM post_likes WHERE post_id = %s", (post_id,))
+        count = cur.fetchone()['count']
+
+        return jsonify({"status": "updated", "likedByMe": liked, "likesCount": count})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+# -----------------------------
+# FEED POST COMMENTS
+# -----------------------------
+@app.get("/api/feed/<post_id>/comments")
+def list_post_comments(post_id):
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT c.id, c.text, c.created_at, u.name AS author_name, u.avatar_url AS author_avatar_url
+        FROM post_comments c
+        JOIN users u ON u.id = c.author_id
+        WHERE c.post_id = %s
+        ORDER BY c.created_at ASC
+    """, (post_id,))
+
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    return jsonify([{
+        "id": str(r['id']),
+        "authorName": r['author_name'],
+        "authorAvatarUrl": r['author_avatar_url'],
+        "text": r['text'],
+        "createdAt": r['created_at'].isoformat() if r['created_at'] else None,
+    } for r in rows])
+
+
+@app.post("/api/feed/<post_id>/comments")
+def create_post_comment(post_id):
+    author_id = get_current_user()
+    if not author_id:
+        return jsonify({"error": "authentication required"}), 401
+
+    data = request.json or {}
+    text = (data.get("text") or "").strip()
+    if not text:
+        return jsonify({"error": "text is required"}), 400
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("""
+            INSERT INTO post_comments (post_id, author_id, text)
+            VALUES (%s, %s, %s)
+            RETURNING id, text, created_at
+        """, (post_id, author_id, text))
+
+        result = cur.fetchone()
+        conn.commit()
+
+        cur.execute("SELECT name, avatar_url FROM users WHERE id = %s", (author_id,))
+        author_info = cur.fetchone()
+
+        return jsonify({
+            "status": "created",
+            "comment": {
+                "id": str(result['id']),
+                "authorName": author_info['name'],
+                "authorAvatarUrl": author_info['avatar_url'],
+                "text": result['text'],
                 "createdAt": result['created_at'].isoformat() if result['created_at'] else None,
             }
         })
