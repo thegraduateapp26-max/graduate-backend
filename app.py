@@ -480,7 +480,6 @@ def update_user(user_id):
                 bio = COALESCE(%s, bio),
                 active_status = COALESCE(%s, active_status),
                 projects = COALESCE(%s, projects),
-                custom_badge = COALESCE(%s, custom_badge),
                 skills = COALESCE(%s, skills)
             WHERE id = %s
             RETURNING id, name, email, role, headline, school, major, location,
@@ -496,7 +495,6 @@ def update_user(user_id):
             data.get("bio"),
             data.get("activeStatus"),
             Json(data.get("projects")) if data.get("projects") is not None else None,
-            data.get("customBadge"),
             data.get("skills"),
             user_id
         ))
@@ -554,6 +552,46 @@ def update_user_verification(user_id):
             return jsonify({"error": "user not found"}), 404
 
         return jsonify({"status": "updated", "id": str(updated['id']), "verificationStatus": updated['verification_status']})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+# -----------------------------
+# ADMIN: CUSTOM BADGE
+# -----------------------------
+@app.patch("/api/users/<user_id>/badge")
+def update_user_badge(user_id):
+    current_user = get_current_user()
+    if not is_admin(current_user):
+        return jsonify({"error": "unauthorized"}), 401
+
+    data = request.json or {}
+    badge = data.get("customBadge")
+    if badge is not None:
+        badge = badge.strip() or None
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("""
+            UPDATE users SET custom_badge = %s
+            WHERE id = %s
+            RETURNING id, custom_badge
+        """, (badge, user_id))
+
+        updated = cur.fetchone()
+        conn.commit()
+
+        if not updated:
+            return jsonify({"error": "user not found"}), 404
+
+        return jsonify({"status": "updated", "id": str(updated['id']), "customBadge": updated['custom_badge']})
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
