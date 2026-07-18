@@ -3,7 +3,7 @@ import datetime
 import bcrypt
 import jwt
 import psycopg2
-from psycopg2.extras import RealDictCursor
+from psycopg2.extras import RealDictCursor, Json
 
 from flask import Flask, jsonify, request, render_template
 from flask_cors import CORS
@@ -187,6 +187,10 @@ def init_db():
     """)
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_matches_sent BOOLEAN DEFAULT FALSE;")
     cur.execute("ALTER TABLE post_comments ADD COLUMN IF NOT EXISTS parent_comment_id UUID REFERENCES post_comments(id);")
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS bio TEXT;")
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS background_url TEXT;")
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS active_status TEXT DEFAULT 'online';")
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS projects JSONB DEFAULT '[]'::jsonb;")
     conn.commit()
     cur.close()
     conn.close()
@@ -410,7 +414,8 @@ def list_users():
 
     cur.execute("""
         SELECT id, name, role, verification_status, headline, school,
-        major, location, avatar_url, skills, created_at
+        major, location, avatar_url, background_url, bio, active_status,
+        projects, skills, created_at
         FROM users
         ORDER BY created_at DESC
         LIMIT 100
@@ -432,6 +437,10 @@ def list_users():
             "major": r['major'],
             "location": r['location'],
             "avatarUrl": r['avatar_url'],
+            "backgroundUrl": r['background_url'],
+            "bio": r['bio'],
+            "activeStatus": r['active_status'] or 'online',
+            "projects": r['projects'] or [],
             "skills": r['skills'] or [],
             "createdAt": r['created_at'].isoformat() if r['created_at'] else None,
         })
@@ -461,9 +470,14 @@ def update_user(user_id):
                 major = COALESCE(%s, major),
                 location = COALESCE(%s, location),
                 avatar_url = COALESCE(%s, avatar_url),
+                background_url = COALESCE(%s, background_url),
+                bio = COALESCE(%s, bio),
+                active_status = COALESCE(%s, active_status),
+                projects = COALESCE(%s, projects),
                 skills = COALESCE(%s, skills)
             WHERE id = %s
-            RETURNING id, name, email, role, headline, school, major, location, avatar_url, skills
+            RETURNING id, name, email, role, headline, school, major, location,
+                avatar_url, background_url, bio, active_status, projects, skills
         """, (
             data.get("name"),
             data.get("headline"),
@@ -471,6 +485,10 @@ def update_user(user_id):
             data.get("major"),
             data.get("location"),
             data.get("avatarUrl"),
+            data.get("backgroundUrl"),
+            data.get("bio"),
+            data.get("activeStatus"),
+            Json(data.get("projects")) if data.get("projects") is not None else None,
             data.get("skills"),
             user_id
         ))
