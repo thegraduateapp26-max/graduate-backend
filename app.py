@@ -191,6 +191,11 @@ def init_db():
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS background_url TEXT;")
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS active_status TEXT DEFAULT 'online';")
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS projects JSONB DEFAULT '[]'::jsonb;")
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS custom_badge TEXT;")
+    # One-time badge assignments (only applied if not already set, so a later admin
+    # edit via the UI isn't silently reverted by a future deploy).
+    cur.execute("UPDATE users SET custom_badge = %s WHERE name = %s AND custom_badge IS NULL;", ("CEO", "Gabrielle Branch"))
+    cur.execute("UPDATE users SET custom_badge = %s WHERE name = %s AND custom_badge IS NULL;", ("CEO's Mom", "Vinnie Brown"))
     conn.commit()
     cur.close()
     conn.close()
@@ -415,7 +420,7 @@ def list_users():
     cur.execute("""
         SELECT id, name, role, verification_status, headline, school,
         major, location, avatar_url, background_url, bio, active_status,
-        projects, skills, created_at
+        projects, custom_badge, skills, created_at
         FROM users
         ORDER BY created_at DESC
         LIMIT 100
@@ -441,6 +446,7 @@ def list_users():
             "bio": r['bio'],
             "activeStatus": r['active_status'] or 'online',
             "projects": r['projects'] or [],
+            "customBadge": r['custom_badge'],
             "skills": r['skills'] or [],
             "createdAt": r['created_at'].isoformat() if r['created_at'] else None,
         })
@@ -474,10 +480,11 @@ def update_user(user_id):
                 bio = COALESCE(%s, bio),
                 active_status = COALESCE(%s, active_status),
                 projects = COALESCE(%s, projects),
+                custom_badge = COALESCE(%s, custom_badge),
                 skills = COALESCE(%s, skills)
             WHERE id = %s
             RETURNING id, name, email, role, headline, school, major, location,
-                avatar_url, background_url, bio, active_status, projects, skills
+                avatar_url, background_url, bio, active_status, projects, custom_badge, skills
         """, (
             data.get("name"),
             data.get("headline"),
@@ -489,6 +496,7 @@ def update_user(user_id):
             data.get("bio"),
             data.get("activeStatus"),
             Json(data.get("projects")) if data.get("projects") is not None else None,
+            data.get("customBadge"),
             data.get("skills"),
             user_id
         ))
