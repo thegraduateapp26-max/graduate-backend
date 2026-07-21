@@ -3,6 +3,7 @@ import datetime
 import secrets
 import bcrypt
 import jwt
+import pyotp
 import psycopg2
 from psycopg2.extras import RealDictCursor, Json
 
@@ -195,6 +196,8 @@ def init_db():
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS custom_badge TEXT;")
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token TEXT;")
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token_expires TIMESTAMP;")
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS two_factor_secret TEXT;")
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS two_factor_enabled BOOLEAN DEFAULT FALSE;")
     # One-time badge assignments (only applied if not already set, so a later admin
     # edit via the UI isn't silently reverted by a future deploy).
     cur.execute("UPDATE users SET custom_badge = %s WHERE name = %s AND custom_badge IS NULL;", ("CEO", "Gabrielle Branch"))
@@ -387,7 +390,7 @@ def login():
     conn = get_conn()
     cur = conn.cursor()
 
-    cur.execute("SELECT id, password_hash, name, role FROM users WHERE email = %s", (email,))
+    cur.execute("SELECT id, password_hash, name, role, two_factor_enabled FROM users WHERE email = %s", (email,))
     user = cur.fetchone()
 
     cur.close()
@@ -398,6 +401,13 @@ def login():
 
     if not bcrypt.checkpw(password.encode("utf-8"), user['password_hash'].encode("utf-8")):
         return jsonify({"error": "invalid credentials"}), 401
+
+    if user['two_factor_enabled']:
+        pending_token = jwt.encode({
+            "pending_2fa_user_id": str(user['id']),
+            "exp": datetime.datetime.utcnow() + datetime.timedelta(minutes=5)
+        }, JWT_SECRET, algorithm="HS256")
+        return jsonify({"requires2FA": True, "pendingToken": pending_token})
 
     token = jwt.encode({
         "user_id": str(user['id']),
@@ -410,6 +420,223 @@ def login():
         "name": user['name'],
         "role": user['role'],
     })
+
+
+@app.post("/api/login/2fa")
+def login_2fa():
+    data = request.json or {}
+    pending_token = data.get("pendingToken")
+    code = (data.get("code") or "").strip()
+
+    if not pending_token or not code:
+        return jsonify({"error": "pendingToken and code are required"}), 400
+
+    try:
+        payload = jwt.decode(pending_token, JWT_SECRET, algorithms=["HS256"])
+        user_id = payload.get("pending_2fa_user_id")
+        if not user_id:
+            raise ValueError("not a valid pending 2FA token")
+    except Exception:
+        return jsonify({"error": "This login session has expired. Please sign in again."}), 401
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("SELECT id, name, role, two_factor_secret, two_factor_enabled FROM users WHERE id = %s", (user_id,))
+    user = cur.fetchone()
+
+    cur.close()
+    conn.close()
+
+    if not user or not user['two_factor_enabled'] or not user['two_factor_secret']:
+        return jsonify({"error": "Two-factor authentication is not set up for this account."}), 400
+
+    totp = pyotp.TOTP(user['two_factor_secret'])
+    if not totp.verify(code, valid_window=1):
+        return jsonify({"error": "Invalid verification code."}), 401
+
+    token = jwt.encode({
+        "user_id": str(user['id']),
+        "exp": datetime.datetime.utcnow() + datetime.timedelta(days=7)
+    }, JWT_SECRET, algorithm="HS256")
+
+    return jsonify({
+        "token": token,
+        "user_id": str(user['id']),
+        "name": user['name'],
+        "role": user['role'],
+    })
+
+
+# -----------------------------
+# TWO-FACTOR AUTHENTICATION
+# -----------------------------
+@app.get("/api/2fa/status")
+def get_2fa_status():
+    user_id = get_current_user()
+    if not user_id:
+        return jsonify({"error": "authentication required"}), 401
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT two_factor_enabled FROM users WHERE id = %s", (user_id,))
+    user = cur.fetchone()
+    cur.close()
+    conn.close()
+
+    if not user:
+        return jsonify({"error": "user not found"}), 404
+
+    return jsonify({"enabled": bool(user['two_factor_enabled'])})
+
+
+@app.post("/api/2fa/setup")
+def setup_2fa():
+    user_id = get_current_user()
+    if not user_id:
+        return jsonify({"error": "authentication required"}), 401
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("SELECT email FROM users WHERE id = %s", (user_id,))
+        user = cur.fetchone()
+        if not user:
+            return jsonify({"error": "user not found"}), 404
+
+        secret = pyotp.random_base32()
+        cur.execute("UPDATE users SET two_factor_secret = %s WHERE id = %s", (secret, user_id))
+        conn.commit()
+
+        otpauth_url = pyotp.TOTP(secret).provisioning_uri(name=user['email'], issuer_name="Graduate")
+
+        return jsonify({"secret": secret, "otpauthUrl": otpauth_url})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.post("/api/2fa/verify-setup")
+def verify_setup_2fa():
+    user_id = get_current_user()
+    if not user_id:
+        return jsonify({"error": "authentication required"}), 401
+
+    data = request.json or {}
+    code = (data.get("code") or "").strip()
+    if not code:
+        return jsonify({"error": "code is required"}), 400
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("SELECT two_factor_secret FROM users WHERE id = %s", (user_id,))
+        user = cur.fetchone()
+        if not user or not user['two_factor_secret']:
+            return jsonify({"error": "Start two-factor setup first."}), 400
+
+        totp = pyotp.TOTP(user['two_factor_secret'])
+        if not totp.verify(code, valid_window=1):
+            return jsonify({"error": "Invalid verification code."}), 401
+
+        cur.execute("UPDATE users SET two_factor_enabled = TRUE WHERE id = %s", (user_id,))
+        conn.commit()
+
+        return jsonify({"status": "enabled"})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.post("/api/2fa/disable")
+def disable_2fa():
+    user_id = get_current_user()
+    if not user_id:
+        return jsonify({"error": "authentication required"}), 401
+
+    data = request.json or {}
+    code = (data.get("code") or "").strip()
+    if not code:
+        return jsonify({"error": "code is required"}), 400
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("SELECT two_factor_secret, two_factor_enabled FROM users WHERE id = %s", (user_id,))
+        user = cur.fetchone()
+        if not user or not user['two_factor_enabled'] or not user['two_factor_secret']:
+            return jsonify({"error": "Two-factor authentication is not enabled."}), 400
+
+        totp = pyotp.TOTP(user['two_factor_secret'])
+        if not totp.verify(code, valid_window=1):
+            return jsonify({"error": "Invalid verification code."}), 401
+
+        cur.execute("UPDATE users SET two_factor_enabled = FALSE, two_factor_secret = NULL WHERE id = %s", (user_id,))
+        conn.commit()
+
+        return jsonify({"status": "disabled"})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+# -----------------------------
+# CHANGE PASSWORD (authenticated, knows current password)
+# -----------------------------
+@app.post("/api/change-password")
+def change_password():
+    user_id = get_current_user()
+    if not user_id:
+        return jsonify({"error": "authentication required"}), 401
+
+    data = request.json or {}
+    current_password = data.get("currentPassword")
+    new_password = data.get("newPassword")
+
+    if not current_password or not new_password:
+        return jsonify({"error": "currentPassword and newPassword are required"}), 400
+    if len(new_password) < 6:
+        return jsonify({"error": "password must be at least 6 characters"}), 400
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("SELECT password_hash FROM users WHERE id = %s", (user_id,))
+        user = cur.fetchone()
+        if not user:
+            return jsonify({"error": "user not found"}), 404
+
+        if not bcrypt.checkpw(current_password.encode("utf-8"), user['password_hash'].encode("utf-8")):
+            return jsonify({"error": "Current password is incorrect."}), 401
+
+        new_hash = bcrypt.hashpw(new_password.encode("utf-8"), bcrypt.gensalt()).decode()
+        cur.execute("UPDATE users SET password_hash = %s WHERE id = %s", (new_hash, user_id))
+        conn.commit()
+
+        return jsonify({"status": "updated"})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    finally:
+        cur.close()
+        conn.close()
 
 
 # -----------------------------
@@ -1218,6 +1445,78 @@ def create_feed_post():
                 "likedByMe": False,
             }
         })
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.patch("/api/feed/<post_id>")
+def edit_feed_post(post_id):
+    user_id = get_current_user()
+    if not user_id:
+        return jsonify({"error": "authentication required"}), 401
+
+    data = request.json or {}
+    content = (data.get("content") or "").strip()
+    if not content:
+        return jsonify({"error": "content is required"}), 400
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("SELECT author_id FROM posts WHERE id = %s", (post_id,))
+        post = cur.fetchone()
+        if not post:
+            return jsonify({"error": "post not found"}), 404
+        if str(post['author_id']) != user_id:
+            return jsonify({"error": "unauthorized"}), 401
+
+        cur.execute(
+            "UPDATE posts SET content = %s WHERE id = %s RETURNING content",
+            (content, post_id)
+        )
+        updated = cur.fetchone()
+        conn.commit()
+
+        return jsonify({"status": "updated", "content": updated['content']})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.delete("/api/feed/<post_id>")
+def delete_feed_post(post_id):
+    user_id = get_current_user()
+    if not user_id:
+        return jsonify({"error": "authentication required"}), 401
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("SELECT author_id FROM posts WHERE id = %s", (post_id,))
+        post = cur.fetchone()
+        if not post:
+            return jsonify({"error": "post not found"}), 404
+        if str(post['author_id']) != user_id:
+            return jsonify({"error": "unauthorized"}), 401
+
+        # No ON DELETE CASCADE on these foreign keys, so clear child rows first.
+        cur.execute("DELETE FROM post_comments WHERE post_id = %s", (post_id,))
+        cur.execute("DELETE FROM post_likes WHERE post_id = %s", (post_id,))
+        cur.execute("DELETE FROM posts WHERE id = %s", (post_id,))
+        conn.commit()
+
+        return jsonify({"status": "deleted"})
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
