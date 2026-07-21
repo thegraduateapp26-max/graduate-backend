@@ -419,6 +419,7 @@ def login():
         "user_id": str(user['id']),
         "name": user['name'],
         "role": user['role'],
+        "email": email,
     })
 
 
@@ -442,7 +443,7 @@ def login_2fa():
     conn = get_conn()
     cur = conn.cursor()
 
-    cur.execute("SELECT id, name, role, two_factor_secret, two_factor_enabled FROM users WHERE id = %s", (user_id,))
+    cur.execute("SELECT id, name, email, role, two_factor_secret, two_factor_enabled FROM users WHERE id = %s", (user_id,))
     user = cur.fetchone()
 
     cur.close()
@@ -464,6 +465,7 @@ def login_2fa():
         "token": token,
         "user_id": str(user['id']),
         "name": user['name'],
+        "email": user['email'],
         "role": user['role'],
     })
 
