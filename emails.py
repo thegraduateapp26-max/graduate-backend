@@ -88,6 +88,23 @@ def send_job_matches_email(name: str, email: str, matches: list):
     })
 
 
+def send_password_reset_email(name: str, email: str, reset_url: str):
+    inner = f"""
+      <h1 style="font-size:22px; color:#0f172a; margin:0 0 12px;">Reset your password</h1>
+      <p style="color:#475569; font-size:14px; line-height:1.6; margin:0 0 4px;">
+        Hi {name}, we received a request to reset your Graduate password. This link expires in
+        1 hour. If you didn't request this, you can safely ignore this email.
+      </p>
+      {_button("Reset Password", reset_url)}
+    """
+    return resend.Emails.send({
+        "from": FROM_EMAIL,
+        "to": email,
+        "subject": "Reset your Graduate password",
+        "html": _wrap(inner),
+    })
+
+
 def send_daily_analytics_email(to_email: str, stats: dict):
     today = datetime.date.today().strftime("%B %d, %Y")
     rows = "".join(f"""

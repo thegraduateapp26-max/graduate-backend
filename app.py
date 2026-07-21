@@ -1,5 +1,6 @@
 import os
 import datetime
+import secrets
 import bcrypt
 import jwt
 import psycopg2
@@ -192,6 +193,8 @@ def init_db():
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS active_status TEXT DEFAULT 'online';")
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS projects JSONB DEFAULT '[]'::jsonb;")
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS custom_badge TEXT;")
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token TEXT;")
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token_expires TIMESTAMP;")
     # One-time badge assignments (only applied if not already set, so a later admin
     # edit via the UI isn't silently reverted by a future deploy).
     cur.execute("UPDATE users SET custom_badge = %s WHERE name = %s AND custom_badge IS NULL;", ("CEO", "Gabrielle Branch"))
@@ -407,6 +410,91 @@ def login():
         "name": user['name'],
         "role": user['role'],
     })
+
+
+# -----------------------------
+# PASSWORD RESET
+# -----------------------------
+@app.post("/api/forgot-password")
+def forgot_password():
+    data = request.json or {}
+    email = data.get("email")
+    if not email:
+        return jsonify({"error": "email is required"}), 400
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("SELECT id, name FROM users WHERE email = %s", (email,))
+        user = cur.fetchone()
+
+        # Always return the same response whether or not the email is registered,
+        # so this endpoint can't be used to check which emails have accounts.
+        if user:
+            token = secrets.token_urlsafe(32)
+            expires = datetime.datetime.utcnow() + datetime.timedelta(hours=1)
+            cur.execute(
+                "UPDATE users SET reset_token = %s, reset_token_expires = %s WHERE id = %s",
+                (token, expires, user['id'])
+            )
+            conn.commit()
+
+            try:
+                reset_url = f"{emails.APP_URL}?view=reset-password&token={token}"
+                emails.send_password_reset_email(user['name'], email, reset_url)
+            except Exception as e:
+                print(f"Password reset email error: {e}")
+
+        return jsonify({"status": "sent"})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.post("/api/reset-password")
+def reset_password():
+    data = request.json or {}
+    token = data.get("token")
+    password = data.get("password")
+
+    if not token or not password:
+        return jsonify({"error": "token and password are required"}), 400
+    if len(password) < 6:
+        return jsonify({"error": "password must be at least 6 characters"}), 400
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute(
+            "SELECT id FROM users WHERE reset_token = %s AND reset_token_expires > NOW()",
+            (token,)
+        )
+        user = cur.fetchone()
+
+        if not user:
+            return jsonify({"error": "This reset link is invalid or has expired."}), 400
+
+        password_hash = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode()
+        cur.execute(
+            "UPDATE users SET password_hash = %s, reset_token = NULL, reset_token_expires = NULL WHERE id = %s",
+            (password_hash, user['id'])
+        )
+        conn.commit()
+
+        return jsonify({"status": "updated"})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    finally:
+        cur.close()
+        conn.close()
 
 
 # -----------------------------
