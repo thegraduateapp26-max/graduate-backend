@@ -41,7 +41,7 @@ def send_welcome_email(name: str, email: str):
     inner = f"""
       <h1 style="font-size:22px; color:#0f172a; margin:0 0 12px;">Welcome to Graduate, {name}!</h1>
       <p style="color:#475569; font-size:14px; line-height:1.6; margin:0 0 12px;">
-        Graduate is your career and education hub &mdash; the place where students, recent grads,
+        Graduate is your career and education hub, the place where students, recent grads,
         employers, and professors connect. Find job openings, discover scholarships, get endorsed
         for your skills, and build the professional network that gets you hired.
       </p>
@@ -128,6 +128,6 @@ def send_daily_analytics_email(to_email: str, stats: dict):
     return resend.Emails.send({
         "from": FROM_EMAIL,
         "to": to_email,
-        "subject": f"Graduate Daily Report — {today}",
+        "subject": f"Graduate Daily Report | {today}",
         "html": _wrap(inner),
     })
