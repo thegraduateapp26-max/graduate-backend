@@ -198,6 +198,9 @@ def init_db():
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token_expires TIMESTAMP;")
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS two_factor_secret TEXT;")
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS two_factor_enabled BOOLEAN DEFAULT FALSE;")
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS expected_graduation_date DATE;")
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS graduation_reminder_sent BOOLEAN DEFAULT FALSE;")
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS grad_year INTEGER;")
     # One-time badge assignments (only applied if not already set, so a later admin
     # edit via the UI isn't silently reverted by a future deploy).
     cur.execute("UPDATE users SET custom_badge = %s WHERE name = %s AND custom_badge IS NULL;", ("CEO", "Gabrielle Branch"))
@@ -347,6 +350,21 @@ def signup():
     if role not in valid_roles:
         role = "graduate"
 
+    if role in ("student", "professor") and not email.lower().strip().endswith(".edu"):
+        return jsonify({"error": "Students and professors must sign up with a .edu email address."}), 400
+
+    expected_graduation_date = None
+    grad_year = None
+    if role == "student":
+        grad_month = data.get("expectedGraduationMonth")
+        grad_year_input = data.get("expectedGraduationYear")
+        if grad_month and grad_year_input:
+            try:
+                expected_graduation_date = datetime.date(int(grad_year_input), int(grad_month), 1)
+                grad_year = int(grad_year_input)
+            except (ValueError, TypeError):
+                return jsonify({"error": "Invalid graduation month/year."}), 400
+
     password_hash = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode()
 
     conn = get_conn()
@@ -354,10 +372,10 @@ def signup():
 
     try:
         cur.execute("""
-            INSERT INTO users (name, email, password_hash, role, verification_status)
-            VALUES (%s, %s, %s, %s, 'pending')
+            INSERT INTO users (name, email, password_hash, role, verification_status, expected_graduation_date, grad_year)
+            VALUES (%s, %s, %s, %s, 'pending', %s, %s)
             RETURNING id;
-        """, (name, email, password_hash, role))
+        """, (name, email, password_hash, role, expected_graduation_date, grad_year))
 
         result = cur.fetchone()
         user_id = result['id']
@@ -642,6 +660,86 @@ def change_password():
 
 
 # -----------------------------
+# CHANGE EMAIL (authenticated, password-confirmed)
+# -----------------------------
+@app.post("/api/change-email")
+def change_email():
+    user_id = get_current_user()
+    if not user_id:
+        return jsonify({"error": "authentication required"}), 401
+
+    data = request.json or {}
+    new_email = (data.get("newEmail") or "").strip()
+    password = data.get("password")
+
+    if not new_email or not password:
+        return jsonify({"error": "newEmail and password are required"}), 400
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("SELECT password_hash FROM users WHERE id = %s", (user_id,))
+        user = cur.fetchone()
+        if not user:
+            return jsonify({"error": "user not found"}), 404
+
+        if not bcrypt.checkpw(password.encode("utf-8"), user['password_hash'].encode("utf-8")):
+            return jsonify({"error": "Incorrect password."}), 401
+
+        cur.execute("SELECT id FROM users WHERE email = %s AND id != %s", (new_email, user_id))
+        if cur.fetchone():
+            return jsonify({"error": "That email is already in use by another account."}), 409
+
+        cur.execute("UPDATE users SET email = %s WHERE id = %s", (new_email, user_id))
+        conn.commit()
+
+        return jsonify({"status": "updated", "email": new_email})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+# -----------------------------
+# SELF-SERVICE STUDENT -> GRADUATE ROLE SWITCH
+# (deliberately one-directional and narrow - no general role-change
+# endpoint exists, to avoid any privilege-escalation surface)
+# -----------------------------
+@app.post("/api/graduate")
+def switch_to_graduate():
+    user_id = get_current_user()
+    if not user_id:
+        return jsonify({"error": "authentication required"}), 401
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("SELECT role FROM users WHERE id = %s", (user_id,))
+        user = cur.fetchone()
+        if not user:
+            return jsonify({"error": "user not found"}), 404
+        if user['role'] != 'student':
+            return jsonify({"error": "Only student accounts can switch to Graduate this way."}), 400
+
+        cur.execute("UPDATE users SET role = 'graduate' WHERE id = %s", (user_id,))
+        conn.commit()
+
+        return jsonify({"status": "updated", "role": "graduate"})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+# -----------------------------
 # PASSWORD RESET
 # -----------------------------
 @app.post("/api/forgot-password")
@@ -737,7 +835,7 @@ def list_users():
     cur.execute("""
         SELECT id, name, role, verification_status, headline, school,
         major, location, avatar_url, background_url, bio, active_status,
-        projects, custom_badge, skills, created_at
+        projects, custom_badge, skills, grad_year, expected_graduation_date, created_at
         FROM users
         ORDER BY created_at DESC
         LIMIT 100
@@ -765,6 +863,8 @@ def list_users():
             "projects": r['projects'] or [],
             "customBadge": r['custom_badge'],
             "skills": r['skills'] or [],
+            "gradYear": r['grad_year'],
+            "expectedGraduationDate": r['expected_graduation_date'].isoformat() if r['expected_graduation_date'] else None,
             "createdAt": r['created_at'].isoformat() if r['created_at'] else None,
         })
 
@@ -797,10 +897,11 @@ def update_user(user_id):
                 bio = COALESCE(%s, bio),
                 active_status = COALESCE(%s, active_status),
                 projects = COALESCE(%s, projects),
+                grad_year = COALESCE(%s, grad_year),
                 skills = COALESCE(%s, skills)
             WHERE id = %s
             RETURNING id, name, email, role, headline, school, major, location,
-                avatar_url, background_url, bio, active_status, projects, custom_badge, skills
+                avatar_url, background_url, bio, active_status, projects, custom_badge, grad_year, skills
         """, (
             data.get("name"),
             data.get("headline"),
@@ -812,6 +913,7 @@ def update_user(user_id):
             data.get("bio"),
             data.get("activeStatus"),
             Json(data.get("projects")) if data.get("projects") is not None else None,
+            data.get("gradYear"),
             data.get("skills"),
             user_id
         ))

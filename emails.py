@@ -88,6 +88,35 @@ def send_job_matches_email(name: str, email: str, matches: list):
     })
 
 
+def send_graduation_reminder_email(name: str, email: str, grad_date_label: str):
+    inner = f"""
+      <h1 style="font-size:22px; color:#0f172a; margin:0 0 12px;">Your graduation is coming up, {name}!</h1>
+      <p style="color:#475569; font-size:14px; line-height:1.6; margin:0 0 12px;">
+        You told us you're set to graduate around <strong>{grad_date_label}</strong> - that's about a
+        month away. We're reaching out now because your school email may stop working once you
+        graduate, and we don't want you to lose access to your Graduate account.
+      </p>
+      <p style="color:#475569; font-size:14px; line-height:1.6; margin:0 0 12px;">
+        Whenever you're ready, head to your account Settings to:
+      </p>
+      <ul style="color:#475569; font-size:14px; line-height:1.8; margin:0 0 16px; padding-left:20px;">
+        <li>Update your email to a personal address you'll keep using</li>
+        <li>Switch your account from Student to Graduate</li>
+      </ul>
+      <p style="color:#94a3b8; font-size:12px; line-height:1.6; margin:0 0 4px;">
+        This is just a heads-up based on the graduation date you gave us when you signed up -
+        no action is required right away.
+      </p>
+      {_button("Go to Settings", f"{APP_URL}?view=settings")}
+    """
+    return resend.Emails.send({
+        "from": FROM_EMAIL,
+        "to": email,
+        "subject": "Graduating soon? A quick heads-up from Graduate",
+        "html": _wrap(inner),
+    })
+
+
 def send_password_reset_email(name: str, email: str, reset_url: str):
     inner = f"""
       <h1 style="font-size:22px; color:#0f172a; margin:0 0 12px;">Reset your password</h1>
