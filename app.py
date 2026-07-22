@@ -20,6 +20,7 @@ import emails
 
 
 app = Flask(__name__, static_folder="static", static_url_path="/static")
+app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024  # 8MB - generous for a resized profile photo, caps abusive oversized request bodies
 # Railway sits in front of the app as a single reverse-proxy hop - without this,
 # request.remote_addr (and therefore rate limiting) would see every user as the proxy's own IP.
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
@@ -1851,9 +1852,17 @@ def create_job():
     if not user_id:
         return jsonify({"error": "authentication required"}), 401
 
-    data = request.json
     conn = get_conn()
     cur = conn.cursor()
+
+    cur.execute("SELECT role FROM users WHERE id = %s", (user_id,))
+    poster = cur.fetchone()
+    if not poster or poster['role'] not in ('employer', 'recruiter', 'admin'):
+        cur.close()
+        conn.close()
+        return jsonify({"error": "Only employer or recruiter accounts can post jobs."}), 403
+
+    data = request.json
 
     try:
         cur.execute("""
@@ -2039,8 +2048,8 @@ def list_scholarships():
 @app.post("/api/scholarships")
 def create_scholarship():
     user_id = get_current_user()
-    if not user_id:
-        return jsonify({"error": "authentication required"}), 401
+    if not is_admin(user_id):
+        return jsonify({"error": "unauthorized"}), 401
 
     data = request.json
 
@@ -2079,8 +2088,8 @@ def create_scholarship():
 @app.delete("/api/scholarships/<scholarship_id>")
 def delete_scholarship(scholarship_id):
     user_id = get_current_user()
-    if not user_id:
-        return jsonify({"error": "authentication required"}), 401
+    if not is_admin(user_id):
+        return jsonify({"error": "unauthorized"}), 401
 
     conn = get_conn()
     cur = conn.cursor()
