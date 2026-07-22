@@ -116,6 +116,13 @@ def _get_pool():
             dsn=DATABASE_URL,
             cursor_factory=RealDictCursor,
             connection_factory=_PooledConnection,
+            # ThreadedConnectionPool holds one process-wide lock across every getconn()/
+            # putconn() call, and opening a brand new physical connection happens while that
+            # lock is held. Without a timeout, a single slow/stuck connection attempt freezes
+            # the lock forever, which hangs every other thread in the worker - including
+            # requests that don't even touch a new connection. Bound it so a bad attempt
+            # fails fast instead of taking the whole worker down with it.
+            connect_timeout=5,
         )
     return _pool
 
