@@ -792,6 +792,119 @@ def switch_to_graduate():
 
 
 # -----------------------------
+# DATA EXPORT (self-only)
+# -----------------------------
+@app.get("/api/users/<user_id>/export")
+def export_user_data(user_id):
+    current_user = get_current_user()
+    if not current_user or current_user != user_id:
+        return jsonify({"error": "unauthorized"}), 401
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    def rows_as_dicts(query, params):
+        cur.execute(query, params)
+        return [dict(r) for r in cur.fetchall()]
+
+    cur.execute("""
+        SELECT id, name, email, role, headline, bio, school, major, location,
+               avatar_url, background_url, custom_badge, grad_year, expected_graduation_date,
+               skills, projects, work_history, verification_status, active_status,
+               two_factor_enabled, created_at
+        FROM users WHERE id = %s
+    """, (user_id,))
+    profile = cur.fetchone()
+    if not profile:
+        cur.close()
+        conn.close()
+        return jsonify({"error": "user not found"}), 404
+
+    data = {
+        "profile": dict(profile),
+        "posts": rows_as_dicts("SELECT id, content, created_at FROM posts WHERE author_id = %s", (user_id,)),
+        "postComments": rows_as_dicts("SELECT id, post_id, text, created_at FROM post_comments WHERE author_id = %s", (user_id,)),
+        "messagesSent": rows_as_dicts("SELECT id, recipient_id, text, created_at FROM messages WHERE sender_id = %s", (user_id,)),
+        "messagesReceived": rows_as_dicts("SELECT id, sender_id, text, created_at FROM messages WHERE recipient_id = %s", (user_id,)),
+        "connections": rows_as_dicts("SELECT id, requester_id, recipient_id, status, created_at FROM connections WHERE requester_id = %s OR recipient_id = %s", (user_id, user_id)),
+        "endorsementsReceived": rows_as_dicts("SELECT id, author_id, relationship, text, visible, created_at FROM endorsements WHERE recipient_id = %s", (user_id,)),
+        "endorsementsWritten": rows_as_dicts("SELECT id, recipient_id, relationship, text, created_at FROM endorsements WHERE author_id = %s", (user_id,)),
+        "jobApplications": rows_as_dicts("SELECT id, job_id, status, created_at FROM applications WHERE user_id = %s", (user_id,)),
+        "jobsPosted": rows_as_dicts("SELECT id, title, company, location, created_at FROM jobs WHERE posted_by = %s", (user_id,)),
+    }
+
+    for record_list in data.values():
+        if isinstance(record_list, list):
+            for record in record_list:
+                for key, value in record.items():
+                    if hasattr(value, "isoformat"):
+                        record[key] = value.isoformat()
+    for key, value in data["profile"].items():
+        if hasattr(value, "isoformat"):
+            data["profile"][key] = value.isoformat()
+
+    cur.close()
+    conn.close()
+
+    response = jsonify(data)
+    response.headers["Content-Disposition"] = "attachment; filename=graduate-data-export.json"
+    return response
+
+
+# -----------------------------
+# ACCOUNT DELETION (self-only, password-confirmed)
+# -----------------------------
+@app.delete("/api/users/<user_id>")
+@limiter.limit("5 per minute")
+def delete_account(user_id):
+    current_user = get_current_user()
+    if not current_user or current_user != user_id:
+        return jsonify({"error": "unauthorized"}), 401
+
+    data = request.json or {}
+    password = data.get("password")
+    if not password:
+        return jsonify({"error": "password is required to confirm account deletion"}), 400
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("SELECT password_hash FROM users WHERE id = %s", (user_id,))
+        user = cur.fetchone()
+        if not user:
+            return jsonify({"error": "user not found"}), 404
+        if not bcrypt.checkpw(password.encode("utf-8"), user['password_hash'].encode("utf-8")):
+            return jsonify({"error": "Incorrect password."}), 401
+
+        # No ON DELETE CASCADE anywhere in this schema, and jobs.posted_by has no cascade
+        # either - clear/delete every dependent row in FK-safe order before the user row itself.
+        cur.execute("UPDATE jobs SET posted_by = NULL WHERE posted_by = %s", (user_id,))
+        cur.execute("DELETE FROM post_comments WHERE post_id IN (SELECT id FROM posts WHERE author_id = %s)", (user_id,))
+        cur.execute("DELETE FROM post_comments WHERE author_id = %s", (user_id,))
+        cur.execute("DELETE FROM post_likes WHERE post_id IN (SELECT id FROM posts WHERE author_id = %s)", (user_id,))
+        cur.execute("DELETE FROM post_likes WHERE user_id = %s", (user_id,))
+        cur.execute("DELETE FROM posts WHERE author_id = %s", (user_id,))
+        cur.execute("DELETE FROM endorsements WHERE recipient_id = %s OR author_id = %s", (user_id, user_id))
+        cur.execute("DELETE FROM messages WHERE sender_id = %s OR recipient_id = %s", (user_id, user_id))
+        cur.execute("DELETE FROM connections WHERE requester_id = %s OR recipient_id = %s", (user_id, user_id))
+        cur.execute("DELETE FROM applications WHERE user_id = %s", (user_id,))
+        cur.execute("DELETE FROM verification_requests WHERE user_id = %s", (user_id,))
+        cur.execute("DELETE FROM users WHERE id = %s", (user_id,))
+        conn.commit()
+
+        return jsonify({"status": "deleted"})
+
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"error": str(e)}), 500
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+# -----------------------------
 # PASSWORD RESET
 # -----------------------------
 @app.post("/api/forgot-password")
