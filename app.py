@@ -85,6 +85,17 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 class _PooledConnection(psycopg2.extensions.connection):
     def close(self):
         if _pool is not None:
+            # Many handlers `return` early inside a try/finally after already running a
+            # query (e.g. a 404 or wrong-password check) without an explicit commit or
+            # rollback. Without this, that leaves the connection sitting in the pool mid
+            # transaction, holding locks indefinitely and eventually wedging every other
+            # request that touches the same rows - roll back defensively (a no-op if the
+            # transaction was already committed/rolled back) before it goes back to the pool.
+            try:
+                if self.status != psycopg2.extensions.STATUS_READY:
+                    self.rollback()
+            except Exception:
+                pass
             _pool.putconn(self)
         else:
             super().close()
