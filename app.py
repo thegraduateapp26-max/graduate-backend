@@ -5,16 +5,26 @@ import bcrypt
 import jwt
 import pyotp
 import psycopg2
+import psycopg2.pool
+import psycopg2.extensions
 from psycopg2.extras import RealDictCursor, Json
 
 from flask import Flask, jsonify, request, render_template
 from flask_cors import CORS
 from flask_swagger_ui import get_swaggerui_blueprint
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 import emails
 
 
 app = Flask(__name__, static_folder="static", static_url_path="/static")
+# Railway sits in front of the app as a single reverse-proxy hop - without this,
+# request.remote_addr (and therefore rate limiting) would see every user as the proxy's own IP.
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+
+limiter = Limiter(get_remote_address, app=app, default_limits=["300 per minute"], storage_uri="memory://")
 
 ALLOWED_ORIGINS = {
     "https://thegraduate.io",
@@ -58,15 +68,48 @@ def handle_preflight():
         response.status_code = 200
         return response
 
-JWT_SECRET = os.environ.get("JWT_SECRET", "super-secret-key")
+JWT_SECRET = os.environ["JWT_SECRET"]  # no insecure fallback - fail loudly if unset rather than sign tokens with a guessable default
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
 
 # -----------------------------
 # Database Connection
 # -----------------------------
+# Every request used to open a brand new Postgres connection (48 call sites) and never reuse
+# one - under real concurrent load that exhausts Postgres's connection limit long before the
+# app itself is CPU or memory bound. A pool fixes this without touching any of those call
+# sites: every existing `conn.close()` already gets called in a `finally` block, and this
+# connection subclass turns that into "return to the pool" instead of actually closing the
+# socket.
+class _PooledConnection(psycopg2.extensions.connection):
+    def close(self):
+        if _pool is not None:
+            _pool.putconn(self)
+        else:
+            super().close()
+
+
+_pool = None
+
+
+def _get_pool():
+    # Created lazily (on first call, i.e. inside init_db()'s try/except below) rather than at
+    # import time, so a DB outage at startup still fails the way it always has - caught and
+    # logged - instead of crashing the whole process before Flask even comes up.
+    global _pool
+    if _pool is None:
+        _pool = psycopg2.pool.ThreadedConnectionPool(
+            minconn=2,
+            maxconn=20,
+            dsn=DATABASE_URL,
+            cursor_factory=RealDictCursor,
+            connection_factory=_PooledConnection,
+        )
+    return _pool
+
+
 def get_conn():
-    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+    return _get_pool().getconn()
 
 
 # -----------------------------
@@ -337,6 +380,7 @@ def status():
 # SIGNUP
 # -----------------------------
 @app.post("/api/signup")
+@limiter.limit("5 per minute")
 def signup():
     data = request.json
     name = data.get("name")
@@ -401,6 +445,7 @@ def signup():
 # LOGIN
 # -----------------------------
 @app.post("/api/login")
+@limiter.limit("15 per minute")
 def login():
     data = request.json
     email = data.get("email")
@@ -443,6 +488,7 @@ def login():
 
 
 @app.post("/api/login/2fa")
+@limiter.limit("15 per minute")
 def login_2fa():
     data = request.json or {}
     pending_token = data.get("pendingToken")
@@ -543,6 +589,7 @@ def setup_2fa():
 
 
 @app.post("/api/2fa/verify-setup")
+@limiter.limit("10 per minute")
 def verify_setup_2fa():
     user_id = get_current_user()
     if not user_id:
@@ -580,6 +627,7 @@ def verify_setup_2fa():
 
 
 @app.post("/api/2fa/disable")
+@limiter.limit("10 per minute")
 def disable_2fa():
     user_id = get_current_user()
     if not user_id:
@@ -620,6 +668,7 @@ def disable_2fa():
 # CHANGE PASSWORD (authenticated, knows current password)
 # -----------------------------
 @app.post("/api/change-password")
+@limiter.limit("10 per minute")
 def change_password():
     user_id = get_current_user()
     if not user_id:
@@ -664,6 +713,7 @@ def change_password():
 # CHANGE EMAIL (authenticated, password-confirmed)
 # -----------------------------
 @app.post("/api/change-email")
+@limiter.limit("10 per minute")
 def change_email():
     user_id = get_current_user()
     if not user_id:
@@ -744,6 +794,7 @@ def switch_to_graduate():
 # PASSWORD RESET
 # -----------------------------
 @app.post("/api/forgot-password")
+@limiter.limit("5 per minute")
 def forgot_password():
     data = request.json or {}
     email = data.get("email")
@@ -785,6 +836,7 @@ def forgot_password():
 
 
 @app.post("/api/reset-password")
+@limiter.limit("10 per minute")
 def reset_password():
     data = request.json or {}
     token = data.get("token")
