@@ -5,8 +5,6 @@ import bcrypt
 import jwt
 import pyotp
 import psycopg2
-import psycopg2.pool
-import psycopg2.extensions
 from psycopg2.extras import RealDictCursor, Json
 
 from flask import Flask, jsonify, request, render_template
@@ -76,59 +74,20 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 # -----------------------------
 # Database Connection
 # -----------------------------
-# Every request used to open a brand new Postgres connection (48 call sites) and never reuse
-# one - under real concurrent load that exhausts Postgres's connection limit long before the
-# app itself is CPU or memory bound. A pool fixes this without touching any of those call
-# sites: every existing `conn.close()` already gets called in a `finally` block, and this
-# connection subclass turns that into "return to the pool" instead of actually closing the
-# socket.
-class _PooledConnection(psycopg2.extensions.connection):
-    def close(self):
-        if _pool is not None:
-            # Many handlers `return` early inside a try/finally after already running a
-            # query (e.g. a 404 or wrong-password check) without an explicit commit or
-            # rollback. Without this, that leaves the connection sitting in the pool mid
-            # transaction, holding locks indefinitely and eventually wedging every other
-            # request that touches the same rows - roll back defensively (a no-op if the
-            # transaction was already committed/rolled back) before it goes back to the pool.
-            try:
-                if self.status != psycopg2.extensions.STATUS_READY:
-                    self.rollback()
-            except Exception:
-                pass
-            _pool.putconn(self)
-        else:
-            super().close()
-
-
-_pool = None
-
-
-def _get_pool():
-    # Created lazily (on first call, i.e. inside init_db()'s try/except below) rather than at
-    # import time, so a DB outage at startup still fails the way it always has - caught and
-    # logged - instead of crashing the whole process before Flask even comes up.
-    global _pool
-    if _pool is None:
-        _pool = psycopg2.pool.ThreadedConnectionPool(
-            minconn=2,
-            maxconn=20,
-            dsn=DATABASE_URL,
-            cursor_factory=RealDictCursor,
-            connection_factory=_PooledConnection,
-            # ThreadedConnectionPool holds one process-wide lock across every getconn()/
-            # putconn() call, and opening a brand new physical connection happens while that
-            # lock is held. Without a timeout, a single slow/stuck connection attempt freezes
-            # the lock forever, which hangs every other thread in the worker - including
-            # requests that don't even touch a new connection. Bound it so a bad attempt
-            # fails fast instead of taking the whole worker down with it.
-            connect_timeout=5,
-        )
-    return _pool
-
-
+# This used to go through a ThreadedConnectionPool, added to avoid opening a fresh Postgres
+# connection per request under load. In practice it introduced a worse failure mode than the
+# one it fixed: the pool holds a single process-wide lock across every getconn()/putconn()
+# call, including the moment a brand new physical connection is opened. When that connection
+# attempt is ever slow or stuck, it holds the lock indefinitely and every other thread in the
+# worker blocks behind it too - including requests that don't touch a new connection at all
+# (reproduced in production twice: one stuck request took the entire worker down, requiring a
+# manual restart both times, with nothing unusual visible on the Postgres side). A plain
+# connection per request can't wedge other requests this way: a slow/stuck connect only ever
+# blocks the one request making it. connect_timeout bounds how long that can take.
 def get_conn():
-    return _get_pool().getconn()
+    return psycopg2.connect(
+        DATABASE_URL, cursor_factory=RealDictCursor, connect_timeout=5
+    )
 
 
 # -----------------------------
