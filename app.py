@@ -1413,7 +1413,13 @@ def list_message_threads():
                EXISTS(
                    SELECT 1 FROM messages m2
                    WHERE m2.sender_id = c.other_id AND m2.recipient_id = %(me)s AND m2.read = FALSE
-               ) AS unread
+               ) AS unread,
+               EXISTS(
+                   SELECT 1 FROM connections co
+                   WHERE co.status = 'accepted'
+                   AND ((co.requester_id = %(me)s AND co.recipient_id = c.other_id)
+                     OR (co.recipient_id = %(me)s AND co.requester_id = c.other_id))
+               ) AS is_connected
         FROM convo c
         JOIN users u ON u.id = c.other_id
         WHERE c.rn = 1
@@ -1431,6 +1437,7 @@ def list_message_threads():
         "lastMessage": r['last_message'],
         "timestamp": r['last_timestamp'].isoformat() if r['last_timestamp'] else None,
         "unread": r['unread'],
+        "isConnected": bool(r['is_connected']),
     } for r in rows])
 
 
