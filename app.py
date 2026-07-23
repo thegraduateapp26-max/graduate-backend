@@ -236,6 +236,7 @@ def init_db():
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS grad_year INTEGER;")
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS work_history JSONB DEFAULT '[]'::jsonb;")
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS endorsements_hidden BOOLEAN DEFAULT FALSE;")
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS deactivated_at TIMESTAMP;")
     # One-time badge assignments (only applied if not already set, so a later admin
     # edit via the UI isn't silently reverted by a future deploy).
     cur.execute("UPDATE users SET custom_badge = %s WHERE name = %s AND custom_badge IS NULL;", ("CEO", "Gabrielle Branch"))
@@ -346,6 +347,24 @@ def is_admin(user_id):
     return bool(row and row['role'] == 'admin')
 
 
+# Logging back in is how a deactivated ("taking a break") account comes back - no separate
+# reactivate step. Called right before a login flow issues its token, so a deactivated user
+# reactivates the moment their credentials (and 2FA code, if enabled) are fully verified.
+def reactivate_user_if_needed(user_id):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT deactivated_at FROM users WHERE id = %s", (user_id,))
+    row = cur.fetchone()
+    reactivated = False
+    if row and row['deactivated_at'] is not None:
+        cur.execute("UPDATE users SET deactivated_at = NULL WHERE id = %s", (user_id,))
+        conn.commit()
+        reactivated = True
+    cur.close()
+    conn.close()
+    return reactivated
+
+
 # -----------------------------
 # Root
 # -----------------------------
@@ -418,7 +437,7 @@ def signup():
         conn.commit()
 
         try:
-            emails.send_welcome_email(name, email)
+            emails.send_welcome_email(name, email, role)
         except Exception as e:
             print(f"Welcome email error: {e}")
 
@@ -469,12 +488,15 @@ def login():
         "exp": datetime.datetime.utcnow() + datetime.timedelta(days=7)
     }, JWT_SECRET, algorithm="HS256")
 
+    reactivated = reactivate_user_if_needed(user['id'])
+
     return jsonify({
         "token": token,
         "user_id": str(user['id']),
         "name": user['name'],
         "role": user['role'],
         "email": email,
+        "reactivated": reactivated,
     })
 
 
@@ -517,12 +539,15 @@ def login_2fa():
         "exp": datetime.datetime.utcnow() + datetime.timedelta(days=7)
     }, JWT_SECRET, algorithm="HS256")
 
+    reactivated = reactivate_user_if_needed(user['id'])
+
     return jsonify({
         "token": token,
         "user_id": str(user['id']),
         "name": user['name'],
         "email": user['email'],
         "role": user['role'],
+        "reactivated": reactivated,
     })
 
 
@@ -896,6 +921,45 @@ def delete_account(user_id):
 
 
 # -----------------------------
+# DEACTIVATE ACCOUNT (a temporary break, not deletion)
+# -----------------------------
+@app.post("/api/deactivate")
+@limiter.limit("5 per minute")
+def deactivate_account():
+    current_user = get_current_user()
+    if not current_user:
+        return jsonify({"error": "authentication required"}), 401
+
+    data = request.json or {}
+    password = data.get("password")
+    if not password:
+        return jsonify({"error": "password is required to confirm deactivation"}), 400
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("SELECT password_hash FROM users WHERE id = %s", (current_user,))
+        row = cur.fetchone()
+        if not row:
+            return jsonify({"error": "user not found"}), 404
+        if not bcrypt.checkpw(password.encode("utf-8"), row['password_hash'].encode("utf-8")):
+            return jsonify({"error": "Incorrect password."}), 401
+
+        cur.execute("UPDATE users SET deactivated_at = NOW() WHERE id = %s", (current_user,))
+        conn.commit()
+        return jsonify({"status": "deactivated"})
+
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"error": str(e)}), 500
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+# -----------------------------
 # PASSWORD RESET
 # -----------------------------
 @app.post("/api/forgot-password")
@@ -1009,6 +1073,7 @@ def list_users():
         u.endorsements_hidden,
         EXISTS(SELECT 1 FROM spotlights s WHERE s.user_id = u.id AND s.is_active = TRUE) AS has_spotlight
         FROM users u
+        WHERE u.deactivated_at IS NULL
         ORDER BY u.created_at DESC
         LIMIT 100
     """)
