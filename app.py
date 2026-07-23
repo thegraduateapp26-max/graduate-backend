@@ -235,6 +235,7 @@ def init_db():
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS graduation_reminder_sent BOOLEAN DEFAULT FALSE;")
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS grad_year INTEGER;")
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS work_history JSONB DEFAULT '[]'::jsonb;")
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS endorsements_hidden BOOLEAN DEFAULT FALSE;")
     # One-time badge assignments (only applied if not already set, so a later admin
     # edit via the UI isn't silently reverted by a future deploy).
     cur.execute("UPDATE users SET custom_badge = %s WHERE name = %s AND custom_badge IS NULL;", ("CEO", "Gabrielle Branch"))
@@ -1005,6 +1006,7 @@ def list_users():
         SELECT u.id, u.name, u.role, u.verification_status, u.headline, u.school,
         u.major, u.location, u.avatar_url, u.background_url, u.bio, u.active_status,
         u.projects, u.custom_badge, u.skills, u.grad_year, u.expected_graduation_date, u.work_history, u.created_at,
+        u.endorsements_hidden,
         EXISTS(SELECT 1 FROM spotlights s WHERE s.user_id = u.id AND s.is_active = TRUE) AS has_spotlight
         FROM users u
         ORDER BY u.created_at DESC
@@ -1038,6 +1040,7 @@ def list_users():
             "workHistory": r['work_history'] or [],
             "createdAt": r['created_at'].isoformat() if r['created_at'] else None,
             "hasSpotlight": bool(r['has_spotlight']) if viewer_can_see_spotlights else False,
+            "endorsementsHidden": bool(r['endorsements_hidden']),
         })
 
     return jsonify(users)
@@ -1071,10 +1074,11 @@ def update_user(user_id):
                 projects = COALESCE(%s, projects),
                 grad_year = COALESCE(%s, grad_year),
                 work_history = COALESCE(%s, work_history),
-                skills = COALESCE(%s, skills)
+                skills = COALESCE(%s, skills),
+                endorsements_hidden = COALESCE(%s, endorsements_hidden)
             WHERE id = %s
             RETURNING id, name, email, role, headline, school, major, location,
-                avatar_url, background_url, bio, active_status, projects, custom_badge, grad_year, work_history, skills
+                avatar_url, background_url, bio, active_status, projects, custom_badge, grad_year, work_history, skills, endorsements_hidden
         """, (
             data.get("name"),
             data.get("headline"),
@@ -1089,6 +1093,7 @@ def update_user(user_id):
             data.get("gradYear"),
             Json(data.get("workHistory")) if data.get("workHistory") is not None else None,
             data.get("skills"),
+            data.get("endorsementsHidden"),
             user_id
         ))
 
