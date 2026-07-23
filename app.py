@@ -18,7 +18,7 @@ import emails
 
 
 app = Flask(__name__, static_folder="static", static_url_path="/static")
-app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024  # 8MB - generous for a resized profile photo, caps abusive oversized request bodies
+app.config["MAX_CONTENT_LENGTH"] = 75 * 1024 * 1024  # 75MB - a 50MB spotlight video becomes ~67MB once base64-encoded; still caps abusive oversized bodies
 # Railway sits in front of the app as a single reverse-proxy hop - without this,
 # request.remote_addr (and therefore rate limiting) would see every user as the proxy's own IP.
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
@@ -205,6 +205,18 @@ def init_db():
             author_id UUID REFERENCES users(id) NOT NULL,
             parent_comment_id UUID REFERENCES post_comments(id),
             text TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT NOW()
+        );
+
+        CREATE TABLE IF NOT EXISTS spotlights (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+            title TEXT,
+            video_url TEXT NOT NULL,
+            thumbnail_url TEXT,
+            duration_seconds INTEGER,
+            views INTEGER DEFAULT 0,
+            is_active BOOLEAN DEFAULT TRUE,
             created_at TIMESTAMP DEFAULT NOW()
         );
     """)
@@ -808,6 +820,7 @@ def export_user_data(user_id):
         "endorsementsWritten": rows_as_dicts("SELECT id, recipient_id, relationship, text, created_at FROM endorsements WHERE author_id = %s", (user_id,)),
         "jobApplications": rows_as_dicts("SELECT id, job_id, status, created_at FROM applications WHERE user_id = %s", (user_id,)),
         "jobsPosted": rows_as_dicts("SELECT id, title, company, location, created_at FROM jobs WHERE posted_by = %s", (user_id,)),
+        "spotlights": rows_as_dicts("SELECT id, title, video_url, thumbnail_url, duration_seconds, views, is_active, created_at FROM spotlights WHERE user_id = %s", (user_id,)),
     }
 
     for record_list in data.values():
@@ -973,15 +986,28 @@ def reset_password():
 # -----------------------------
 @app.get("/api/users")
 def list_users():
+    # The Spotlight badge (hasSpotlight) is only meaningful to recruiters/employers/admins -
+    # everyone else gets it as always-false, so students/graduates get no signal at all about
+    # who else has one, matching the rule that only recruiters/employers/admins can see
+    # anything Spotlight-related about other members.
+    viewer_id = get_current_user()
+
     conn = get_conn()
     cur = conn.cursor()
 
+    viewer_can_see_spotlights = False
+    if viewer_id:
+        cur.execute("SELECT role FROM users WHERE id = %s", (viewer_id,))
+        viewer = cur.fetchone()
+        viewer_can_see_spotlights = bool(viewer and viewer['role'] in SPOTLIGHT_VIEWER_ROLES)
+
     cur.execute("""
-        SELECT id, name, role, verification_status, headline, school,
-        major, location, avatar_url, background_url, bio, active_status,
-        projects, custom_badge, skills, grad_year, expected_graduation_date, work_history, created_at
-        FROM users
-        ORDER BY created_at DESC
+        SELECT u.id, u.name, u.role, u.verification_status, u.headline, u.school,
+        u.major, u.location, u.avatar_url, u.background_url, u.bio, u.active_status,
+        u.projects, u.custom_badge, u.skills, u.grad_year, u.expected_graduation_date, u.work_history, u.created_at,
+        EXISTS(SELECT 1 FROM spotlights s WHERE s.user_id = u.id AND s.is_active = TRUE) AS has_spotlight
+        FROM users u
+        ORDER BY u.created_at DESC
         LIMIT 100
     """)
 
@@ -1011,6 +1037,7 @@ def list_users():
             "expectedGraduationDate": r['expected_graduation_date'].isoformat() if r['expected_graduation_date'] else None,
             "workHistory": r['work_history'] or [],
             "createdAt": r['created_at'].isoformat() if r['created_at'] else None,
+            "hasSpotlight": bool(r['has_spotlight']) if viewer_can_see_spotlights else False,
         })
 
     return jsonify(users)
@@ -2190,6 +2217,213 @@ def delete_scholarship(scholarship_id):
         return jsonify({"status": "deleted"})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+    finally:
+        cur.close()
+        conn.close()
+
+
+# -----------------------------
+# SPOTLIGHTS
+# -----------------------------
+# Short video pitches. Students/graduates/admins upload one (uploading a new one replaces
+# any existing one - only one active spotlight per user); recruiters/employers/admins browse
+# them. Students and graduates never get to browse other people's - the whole point is a
+# recruiter-facing discovery surface, not another social feed.
+SPOTLIGHT_VIEWER_ROLES = ("recruiter", "employer", "admin")
+SPOTLIGHT_UPLOADER_ROLES = ("student", "graduate", "admin")
+
+
+@app.post("/api/spotlights")
+@limiter.limit("10 per hour")
+def create_spotlight():
+    user_id = get_current_user()
+    if not user_id:
+        return jsonify({"error": "authentication required"}), 401
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("SELECT role FROM users WHERE id = %s", (user_id,))
+        uploader = cur.fetchone()
+        if not uploader or uploader['role'] not in SPOTLIGHT_UPLOADER_ROLES:
+            return jsonify({"error": "Only student and graduate accounts can upload a Spotlight."}), 403
+
+        data = request.json or {}
+        video_url = data.get("videoUrl")
+        if not video_url:
+            return jsonify({"error": "videoUrl is required"}), 400
+
+        duration = data.get("durationSeconds")
+        if duration is not None and duration > 60:
+            return jsonify({"error": "Spotlights must be 60 seconds or shorter."}), 400
+
+        # Only one active spotlight per user - a new upload replaces whatever was there.
+        cur.execute("DELETE FROM spotlights WHERE user_id = %s", (user_id,))
+        cur.execute("""
+            INSERT INTO spotlights (user_id, title, video_url, thumbnail_url, duration_seconds)
+            VALUES (%s, %s, %s, %s, %s)
+            RETURNING id
+        """, (user_id, data.get("title"), video_url, data.get("thumbnailUrl"), duration))
+
+        result = cur.fetchone()
+        conn.commit()
+        return jsonify({"status": "spotlight created", "spotlight_id": str(result['id'])})
+
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"error": str(e)}), 500
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.get("/api/spotlights")
+def list_spotlights():
+    user_id = get_current_user()
+    if not user_id:
+        return jsonify({"error": "authentication required"}), 401
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("SELECT role FROM users WHERE id = %s", (user_id,))
+        viewer = cur.fetchone()
+        if not viewer or viewer['role'] not in SPOTLIGHT_VIEWER_ROLES:
+            return jsonify({"error": "Only recruiter and employer accounts can view Spotlights."}), 403
+
+        cur.execute("""
+            SELECT s.id, s.title, s.video_url, s.thumbnail_url, s.duration_seconds, s.views, s.created_at,
+                   u.id AS user_id, u.name, u.role, u.school, u.major, u.skills, u.avatar_url, u.headline
+            FROM spotlights s
+            JOIN users u ON u.id = s.user_id
+            WHERE s.is_active = TRUE
+            ORDER BY s.created_at DESC
+        """)
+        rows = cur.fetchall()
+
+        spotlights = [{
+            "id": str(r['id']),
+            "title": r['title'],
+            "videoUrl": r['video_url'],
+            "thumbnailUrl": r['thumbnail_url'],
+            "durationSeconds": r['duration_seconds'],
+            "views": r['views'],
+            "createdAt": r['created_at'].isoformat() if r['created_at'] else None,
+            "user": {
+                "id": str(r['user_id']),
+                "name": r['name'],
+                "role": r['role'],
+                "school": r['school'],
+                "major": r['major'],
+                "skills": r['skills'] or [],
+                "avatarUrl": r['avatar_url'],
+                "headline": r['headline'],
+            },
+        } for r in rows]
+
+        return jsonify(spotlights)
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.get("/api/spotlights/mine")
+def get_my_spotlight():
+    user_id = get_current_user()
+    if not user_id:
+        return jsonify({"error": "authentication required"}), 401
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("""
+            SELECT id, title, video_url, thumbnail_url, duration_seconds, views, created_at
+            FROM spotlights
+            WHERE user_id = %s AND is_active = TRUE
+            ORDER BY created_at DESC
+            LIMIT 1
+        """, (user_id,))
+        r = cur.fetchone()
+
+        if not r:
+            return jsonify(None)
+
+        return jsonify({
+            "id": str(r['id']),
+            "title": r['title'],
+            "videoUrl": r['video_url'],
+            "thumbnailUrl": r['thumbnail_url'],
+            "durationSeconds": r['duration_seconds'],
+            "views": r['views'],
+            "createdAt": r['created_at'].isoformat() if r['created_at'] else None,
+        })
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.delete("/api/spotlights/<spotlight_id>")
+def delete_spotlight(spotlight_id):
+    user_id = get_current_user()
+    if not user_id:
+        return jsonify({"error": "authentication required"}), 401
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("SELECT user_id FROM spotlights WHERE id = %s", (spotlight_id,))
+        row = cur.fetchone()
+        if not row:
+            return jsonify({"error": "spotlight not found"}), 404
+        if str(row['user_id']) != user_id and not is_admin(user_id):
+            return jsonify({"error": "unauthorized"}), 403
+
+        cur.execute("DELETE FROM spotlights WHERE id = %s", (spotlight_id,))
+        conn.commit()
+        return jsonify({"status": "deleted"})
+
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"error": str(e)}), 500
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.post("/api/spotlights/<spotlight_id>/view")
+def view_spotlight(spotlight_id):
+    user_id = get_current_user()
+    if not user_id:
+        return jsonify({"error": "authentication required"}), 401
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("SELECT role FROM users WHERE id = %s", (user_id,))
+        viewer = cur.fetchone()
+        if not viewer or viewer['role'] not in SPOTLIGHT_VIEWER_ROLES:
+            return jsonify({"error": "Only recruiter and employer accounts can view Spotlights."}), 403
+
+        cur.execute("UPDATE spotlights SET views = views + 1 WHERE id = %s AND is_active = TRUE RETURNING views", (spotlight_id,))
+        row = cur.fetchone()
+        if not row:
+            return jsonify({"error": "spotlight not found"}), 404
+        conn.commit()
+        return jsonify({"views": row['views']})
+
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"error": str(e)}), 500
+
     finally:
         cur.close()
         conn.close()
