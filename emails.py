@@ -61,6 +61,16 @@ _ROLE_CONTENT = {
         "cta": "Complete Your Profile",
         "cta_view": "profile",
     },
+    "high_school_graduate": {
+        "tagline": "Let's help you find scholarships and your first opportunities out of high school.",
+        "items": [
+            "Complete your profile so we can start matching you to scholarships",
+            "Upload a Spotlight - a 60-second video pitch that gets you noticed",
+            "Browse entry-level jobs and internships that don't require a degree yet",
+        ],
+        "cta": "Complete Your Profile",
+        "cta_view": "profile",
+    },
     "graduate": {
         "tagline": "Let's get you in front of recruiters who are actually hiring.",
         "items": [

@@ -401,7 +401,7 @@ def signup():
         return jsonify({"error": "missing fields"}), 400
 
     role = data.get("role", "graduate")
-    valid_roles = ["student", "graduate", "employer", "professor", "recruiter"]
+    valid_roles = ["student", "graduate", "employer", "professor", "recruiter", "high_school_graduate"]
     if role not in valid_roles:
         role = "graduate"
 
@@ -2307,7 +2307,7 @@ def delete_scholarship(scholarship_id):
 # them. Students and graduates never get to browse other people's - the whole point is a
 # recruiter-facing discovery surface, not another social feed.
 SPOTLIGHT_VIEWER_ROLES = ("recruiter", "employer", "admin")
-SPOTLIGHT_UPLOADER_ROLES = ("student", "graduate", "admin")
+SPOTLIGHT_UPLOADER_ROLES = ("student", "graduate", "admin", "high_school_graduate")
 
 
 @app.post("/api/spotlights")
@@ -2324,7 +2324,7 @@ def create_spotlight():
         cur.execute("SELECT role FROM users WHERE id = %s", (user_id,))
         uploader = cur.fetchone()
         if not uploader or uploader['role'] not in SPOTLIGHT_UPLOADER_ROLES:
-            return jsonify({"error": "Only student and graduate accounts can upload a Spotlight."}), 403
+            return jsonify({"error": "Only student, graduate, and high school graduate accounts can upload a Spotlight."}), 403
 
         data = request.json or {}
         video_url = data.get("videoUrl")
