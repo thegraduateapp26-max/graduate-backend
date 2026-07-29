@@ -6,6 +6,8 @@ import jwt
 import pyotp
 import psycopg2
 from psycopg2.extras import RealDictCursor, Json
+from google.oauth2 import id_token as google_id_token
+from google.auth.transport import requests as google_requests
 
 from flask import Flask, jsonify, request, render_template
 from flask_cors import CORS
@@ -68,6 +70,7 @@ def handle_preflight():
         return response
 
 JWT_SECRET = os.environ["JWT_SECRET"]  # no insecure fallback - fail loudly if unset rather than sign tokens with a guessable default
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")  # unset until a Google Cloud OAuth Client ID is created; endpoint 503s until then
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
 
@@ -489,6 +492,75 @@ def login():
     }, JWT_SECRET, algorithm="HS256")
 
     reactivated = reactivate_user_if_needed(user['id'])
+
+    return jsonify({
+        "token": token,
+        "user_id": str(user['id']),
+        "name": user['name'],
+        "role": user['role'],
+        "email": email,
+        "reactivated": reactivated,
+    })
+
+
+# -----------------------------
+# GOOGLE SIGN-IN / SIGN-UP
+# -----------------------------
+# Verifies the ID token Google's client-side library hands back, then logs the
+# matching user in (by email) or creates a new one. New accounts default to the
+# 'graduate' role since there's no signup form to pick one in this flow - the
+# existing self-service role switch covers anyone who needs something else.
+@app.post("/api/auth/google")
+@limiter.limit("15 per minute")
+def auth_google():
+    if not GOOGLE_CLIENT_ID:
+        return jsonify({"error": "Google sign-in is not configured yet."}), 503
+
+    data = request.json
+    credential = data.get("credential") if data else None
+    if not credential:
+        return jsonify({"error": "missing credential"}), 400
+
+    try:
+        payload = google_id_token.verify_oauth2_token(credential, google_requests.Request(), GOOGLE_CLIENT_ID)
+    except ValueError:
+        return jsonify({"error": "invalid Google credential"}), 401
+
+    email = payload.get("email")
+    if not email or not payload.get("email_verified"):
+        return jsonify({"error": "Google account email is not verified"}), 401
+
+    name = payload.get("name") or email.split("@")[0]
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("SELECT id, name, role FROM users WHERE email = %s", (email,))
+    user = cur.fetchone()
+
+    if not user:
+        random_password_hash = bcrypt.hashpw(secrets.token_urlsafe(32).encode("utf-8"), bcrypt.gensalt()).decode()
+        cur.execute("""
+            INSERT INTO users (name, email, password_hash, role, verification_status)
+            VALUES (%s, %s, %s, 'graduate', 'pending')
+            RETURNING id, name, role;
+        """, (name, email, random_password_hash))
+        user = cur.fetchone()
+        conn.commit()
+        try:
+            emails.send_welcome_email(name, email, 'graduate')
+        except Exception as e:
+            print(f"Welcome email error: {e}")
+
+    reactivated = reactivate_user_if_needed(user['id'])
+
+    cur.close()
+    conn.close()
+
+    token = jwt.encode({
+        "user_id": str(user['id']),
+        "exp": datetime.datetime.utcnow() + datetime.timedelta(days=7)
+    }, JWT_SECRET, algorithm="HS256")
 
     return jsonify({
         "token": token,
