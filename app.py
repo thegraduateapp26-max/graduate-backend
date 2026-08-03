@@ -243,6 +243,7 @@ def init_db():
     # Richer job-listing fields: job_type/salary_range already cover employment type and pay
     # rate, so these fill in the rest (function, industry, seniority, and the structured
     # sections of a real posting) for listings pulled from a real jobs source.
+    cur.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS employment_type TEXT;")  # Internship/Full-time/Part-time - job_type already means remote/hybrid/onsite on the frontend
     cur.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS job_function TEXT;")
     cur.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS industry TEXT;")
     cur.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS seniority_level TEXT;")
@@ -2094,7 +2095,7 @@ def list_jobs():
     cur.execute("""
         SELECT id, title, company, location, salary_range,
         job_type, description, url, tags, created_at, is_active,
-        job_function, industry, seniority_level, job_summary,
+        job_function, industry, seniority_level, job_summary, employment_type,
         key_responsibilities, qualifications, about_company, logo_url
         FROM jobs
         WHERE is_active = TRUE
@@ -2123,6 +2124,7 @@ def list_jobs():
             "jobFunction": r['job_function'],
             "industry": r['industry'],
             "seniorityLevel": r['seniority_level'],
+            "employmentType": r['employment_type'],
             "jobSummary": r['job_summary'],
             "keyResponsibilities": r['key_responsibilities'] or [],
             "qualifications": r['qualifications'] or [],
@@ -2158,9 +2160,9 @@ def create_job():
         cur.execute("""
             INSERT INTO jobs (
                 title, company, location, salary_range, job_type, description, url, tags, posted_by,
-                job_function, industry, seniority_level, job_summary, key_responsibilities, qualifications, about_company, logo_url
+                job_function, industry, seniority_level, job_summary, key_responsibilities, qualifications, about_company, logo_url, employment_type
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id
         """, (
             data.get("title"), data.get("company"), data.get("location"),
@@ -2168,7 +2170,7 @@ def create_job():
             data.get("url"), data.get("tags"), user_id,
             data.get("jobFunction"), data.get("industry"), data.get("seniorityLevel"),
             data.get("jobSummary"), data.get("keyResponsibilities"), data.get("qualifications"),
-            data.get("aboutCompany"), data.get("logoUrl"),
+            data.get("aboutCompany"), data.get("logoUrl"), data.get("employmentType"),
         ))
 
         result = cur.fetchone()
