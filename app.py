@@ -240,6 +240,20 @@ def init_db():
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS work_history JSONB DEFAULT '[]'::jsonb;")
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS endorsements_hidden BOOLEAN DEFAULT FALSE;")
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS deactivated_at TIMESTAMP;")
+    # Richer job-listing fields: job_type/salary_range already cover employment type and pay
+    # rate, so these fill in the rest (function, industry, seniority, and the structured
+    # sections of a real posting) for listings pulled from a real jobs source.
+    cur.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS job_function TEXT;")
+    cur.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS industry TEXT;")
+    cur.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS seniority_level TEXT;")
+    cur.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS job_summary TEXT;")
+    cur.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS key_responsibilities TEXT[];")
+    cur.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS qualifications TEXT[];")
+    cur.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS about_company TEXT;")
+    cur.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS logo_url TEXT;")
+    cur.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS source TEXT;")
+    cur.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS source_id TEXT;")
+    cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS jobs_source_source_id_idx ON jobs (source, source_id) WHERE source IS NOT NULL;")
     # One-time badge assignments (only applied if not already set, so a later admin
     # edit via the UI isn't silently reverted by a future deploy).
     cur.execute("UPDATE users SET custom_badge = %s WHERE name = %s AND custom_badge IS NULL;", ("CEO", "Gabrielle Branch"))
@@ -2079,11 +2093,13 @@ def list_jobs():
 
     cur.execute("""
         SELECT id, title, company, location, salary_range,
-        job_type, description, url, tags, created_at, is_active
+        job_type, description, url, tags, created_at, is_active,
+        job_function, industry, seniority_level, job_summary,
+        key_responsibilities, qualifications, about_company, logo_url
         FROM jobs
         WHERE is_active = TRUE
         ORDER BY created_at DESC
-        LIMIT 50
+        LIMIT 150
     """)
 
     rows = cur.fetchall()
@@ -2103,7 +2119,15 @@ def list_jobs():
             "url": r['url'],
             "tags": r['tags'] or [],
             "createdAt": r['created_at'].isoformat() if r['created_at'] else None,
-            "isActive": r['is_active']
+            "isActive": r['is_active'],
+            "jobFunction": r['job_function'],
+            "industry": r['industry'],
+            "seniorityLevel": r['seniority_level'],
+            "jobSummary": r['job_summary'],
+            "keyResponsibilities": r['key_responsibilities'] or [],
+            "qualifications": r['qualifications'] or [],
+            "aboutCompany": r['about_company'],
+            "logoUrl": r['logo_url'],
         })
 
     return jsonify(jobs)
@@ -2132,13 +2156,19 @@ def create_job():
 
     try:
         cur.execute("""
-            INSERT INTO jobs (title, company, location, salary_range, job_type, description, url, tags, posted_by)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO jobs (
+                title, company, location, salary_range, job_type, description, url, tags, posted_by,
+                job_function, industry, seniority_level, job_summary, key_responsibilities, qualifications, about_company, logo_url
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id
         """, (
             data.get("title"), data.get("company"), data.get("location"),
             data.get("salaryRange"), data.get("jobType"), data.get("description"),
-            data.get("url"), data.get("tags"), user_id
+            data.get("url"), data.get("tags"), user_id,
+            data.get("jobFunction"), data.get("industry"), data.get("seniorityLevel"),
+            data.get("jobSummary"), data.get("keyResponsibilities"), data.get("qualifications"),
+            data.get("aboutCompany"), data.get("logoUrl"),
         ))
 
         result = cur.fetchone()

@@ -15,7 +15,7 @@ def _wrap(inner_html: str) -> str:
     <div style="font-family: -apple-system, Segoe UI, Helvetica, Arial, sans-serif; background:#f8fafc; padding:32px 16px;">
       <div style="max-width:560px; margin:0 auto; background:#ffffff; border-radius:16px; overflow:hidden; border:1px solid #f1f5f9;">
         <div style="background:{BRAND_COLOR}; padding:24px 32px;">
-          <span style="color:#ffffff; font-size:20px; font-weight:800; font-family:Georgia, serif;">Graduate</span>
+          <span style="color:#ffffff; font-size:20px; font-weight:800; font-family:Georgia, serif;">Grad<span style="color:#a5b4fc;">uate</span></span>
         </div>
         <div style="padding:32px;">
           {inner_html}
