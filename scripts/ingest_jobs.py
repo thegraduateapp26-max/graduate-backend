@@ -16,7 +16,7 @@ import time
 import psycopg2
 import psycopg2.extras
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, NavigableString
 
 API_URL = "https://www.themuse.com/api/public/jobs"
 LEVELS = ["Internship", "Entry Level"]
@@ -136,49 +136,102 @@ def classify_header(text):
     return None
 
 
-def split_header_paragraph(tag):
-    """Handles both standalone header paragraphs (<p><strong>Header</strong></p>) and the more
-    common inline form (<p><strong>Header:</strong><br>rest of the paragraph...</p>) - returns
-    (header_text, remaining_text) or (None, full_text) if this isn't a header paragraph at all."""
-    strong = tag.find(["strong", "b"])
-    if not strong:
-        return None, clean_text(tag)
-    first_tag = tag.find(True)
-    if first_tag is not strong:
-        return None, clean_text(tag)
-    header_text = clean_text(strong).rstrip(":").strip()
-    if not header_text or len(header_text) > 60:
-        return None, clean_text(tag)
-    full = clean_text(tag)
-    remaining = full[len(clean_text(strong)):].strip(" : -")
-    return header_text, remaining
+BLOCK_TAGS = {"p", "div", "h1", "h2", "h3", "h4", "h5", "h6"}
+
+
+def iter_runs(node):
+    """Walks the tree in document order, yielding ('text', str), ('bold', str), ('li', str),
+    or ('break', None). Linearizes content regardless of whether section headers are their own
+    <p> tags or just inline <strong>/<b> runs inside one big paragraph separated by <br>, which
+    is a common pattern in real job postings."""
+    for child in node.children:
+        if isinstance(child, NavigableString):
+            s = str(child)
+            if s.strip():
+                yield ("text", s)
+            continue
+        name = getattr(child, "name", None)
+        if name == "br":
+            yield ("break", None)
+        elif name in ("strong", "b"):
+            t = clean_text(child)
+            if t:
+                yield ("bold", t)
+        elif name in ("ul", "ol"):
+            yield ("break", None)
+            for li in child.find_all("li", recursive=False):
+                t = clean_text(li)
+                if t:
+                    yield ("li", t)
+            yield ("break", None)
+        elif name in BLOCK_TAGS:
+            yield ("break", None)
+            if name in ("h1", "h2", "h3", "h4", "h5", "h6"):
+                t = clean_text(child)
+                if t:
+                    yield ("bold", t)
+            else:
+                yield from iter_runs(child)
+            yield ("break", None)
+        elif name in ("a", "span", "em", "i", "u", "font"):
+            yield from iter_runs(child)
+        elif child.find(True) is not None or clean_text(child):
+            yield from iter_runs(child)
+
+
+def group_lines(runs):
+    """Groups the flat run stream into lines at 'break' boundaries: ('li', None, text) or
+    ('line', leading_bold_or_None, full_text)."""
+    lines = []
+    buf = []
+    leading_bold = None
+
+    def flush():
+        nonlocal buf, leading_bold
+        text = " ".join(b for _, b in buf).strip()
+        text = re.sub(r"\s+", " ", text)
+        if text:
+            lines.append(("line", leading_bold, text))
+        buf = []
+        leading_bold = None
+
+    for kind, val in runs:
+        if kind == "break":
+            flush()
+        elif kind == "li":
+            flush()
+            lines.append(("li", None, val))
+        else:
+            if not buf and kind == "bold":
+                leading_bold = val
+            buf.append((kind, val))
+    flush()
+    return lines
 
 
 def parse_contents(html):
     soup = BeautifulSoup(html or "", "html.parser")
+    lines = group_lines(iter_runs(soup))
+
     sections = {"summary": [], "responsibilities": [], "qualifications": [], "about": [], "other": []}
     current = "summary"
-    for el in soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6", "p", "ul", "ol", "div"], recursive=False):
-        if el.name in ("h1", "h2", "h3", "h4", "h5", "h6"):
-            current = classify_header(clean_text(el)) or "other"
+    for kind, leading_bold, text in lines:
+        if kind == "li":
+            sections[current].append(text)
             continue
-        if el.name in ("ul", "ol"):
-            items = [clean_text(li) for li in el.find_all("li") if clean_text(li)]
-            if current in ("responsibilities", "qualifications"):
-                sections[current].extend(items)
-            else:
-                sections[current].append(" ".join(items))
+        header_text = None
+        remaining = text
+        if leading_bold and len(leading_bold) <= 60:
+            header_candidate = leading_bold.rstrip(":").strip()
+            if header_candidate and (text == leading_bold or text.startswith(leading_bold)):
+                header_text = header_candidate
+                remaining = text[len(leading_bold):].strip(" :-–—")
+        if header_text:
+            current = classify_header(header_text) or "other"
+            if remaining:
+                sections[current].append(remaining)
             continue
-        if el.name in ("p", "div"):
-            header_text, remaining = split_header_paragraph(el)
-            if header_text:
-                current = classify_header(header_text) or "other"
-                if remaining:
-                    sections[current].append(remaining)
-                continue
-            text = clean_text(el)
-            if text:
-                sections[current].append(text)
+        sections[current].append(text)
 
     job_summary = " ".join(sections["summary"][:3])[:800] or None
     about_company = " ".join(sections["about"])[:1200] or None
@@ -331,6 +384,10 @@ def main():
     print(f"  with matched real logo: {with_logo} ({with_logo * 100 // max(len(rows),1)}%)")
     with_salary = sum(1 for r in rows if r["salary_range"])
     print(f"  with extracted salary: {with_salary}")
+    with_resp = sum(1 for r in rows if r["key_responsibilities"])
+    print(f"  with responsibilities: {with_resp}")
+    with_qual = sum(1 for r in rows if r["qualifications"])
+    print(f"  with qualifications: {with_qual}")
 
     conn = psycopg2.connect(os.environ["DATABASE_URL"])
     n = upsert_jobs(conn, rows)
