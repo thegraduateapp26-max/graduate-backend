@@ -10,6 +10,7 @@ Usage:
 """
 import json
 import os
+import random
 import re
 import time
 
@@ -20,8 +21,20 @@ from bs4 import BeautifulSoup, NavigableString
 
 API_URL = "https://www.themuse.com/api/public/jobs"
 LEVELS = ["Internship", "Entry Level"]
-PAGES_PER_LEVEL = 20  # ~20 results/page -> up to ~400 candidates per level before filtering
-TARGET_COUNT = 300
+# The Muse's actual category taxonomy (confirmed by sampling live results - its docs list
+# a different/stale set). Querying category-by-category, instead of only paging through the
+# unfiltered level feed, is what gets breadth across industries instead of an unfiltered feed
+# that's dominated by whichever few employers (Walmart, CVS) post the most listings.
+CATEGORIES = [
+    "Software Engineering", "Data and Analytics", "Design and UX", "Science and Engineering",
+    "Accounting and Finance", "Sales", "Account Management", "Advertising and Marketing",
+    "Business Operations", "Management", "Project Management", "Human Resources and Recruitment",
+    "Customer Service", "Administration and Office", "Healthcare", "Education",
+    "Transportation and Logistics", "Food and Hospitality Services",
+]
+PAGES_PER_QUERY = 6  # ~20 results/page; multiplied by len(CATEGORIES) so kept modest
+MAX_PER_COMPANY = 6  # prevents one high-volume poster (e.g. Walmart, CVS) from crowding out everyone else
+TARGET_COUNT = 350
 
 COMPANIES_JSON = os.path.join(
     os.path.dirname(__file__), "..", "..",
@@ -37,37 +50,23 @@ US_STATES = {
 
 CATEGORY_TO_INDUSTRY = {
     "Software Engineering": "Technology",
-    "Engineering": "Technology",
-    "Data Science": "Technology",
     "Data and Analytics": "Technology",
-    "IT": "Technology",
-    "UX": "Technology",
-    "Product Management": "Technology",
-    "Design": "Design",
-    "Creative & Design": "Design",
-    "Editorial": "Media & Communications",
-    "Media Production": "Media & Communications",
-    "Media Communications": "Media & Communications",
-    "Writing & Editing": "Media & Communications",
-    "Social Media & Community": "Marketing",
-    "Marketing": "Marketing",
-    "Marketing and PR": "Marketing",
-    "Public Relations": "Marketing",
+    "Design and UX": "Design",
+    "Science and Engineering": "Science",
+    "Accounting and Finance": "Finance",
     "Sales": "Sales",
     "Account Management": "Sales",
-    "Customer Service": "Customer Support",
-    "Business and Strategy": "Business",
-    "Project and Product Management": "Business",
-    "Operations": "Operations",
+    "Advertising and Marketing": "Marketing",
+    "Business Operations": "Business",
+    "Management": "Business",
+    "Project Management": "Business",
     "Human Resources and Recruitment": "Human Resources",
-    "Finance": "Finance",
-    "Accounting": "Finance",
-    "Legal Services": "Legal",
+    "Customer Service": "Customer Support",
+    "Administration and Office": "Business",
     "Healthcare": "Healthcare",
-    "Healthcare & Medicine": "Healthcare",
     "Education": "Education",
-    "Retail": "Retail",
-    "Science and Engineering": "Science",
+    "Transportation and Logistics": "Logistics",
+    "Food and Hospitality Services": "Hospitality",
 }
 
 RESPONSIBILITY_HEADERS = re.compile(
@@ -253,11 +252,22 @@ def extract_salary(text):
     return m.group(0).strip() if m else None
 
 
-def fetch_level(level, pages):
+def fetch_query(level, category, pages):
     for page in range(pages):
-        resp = requests.get(API_URL, params={"level": level, "page": page}, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
+        data = None
+        for attempt in range(3):
+            try:
+                resp = requests.get(API_URL, params={"level": level, "category": category, "page": page}, timeout=20)
+                resp.raise_for_status()
+                data = resp.json()
+                break
+            except requests.exceptions.RequestException as e:
+                if attempt == 2:
+                    print(f"  (giving up on '{category}'/'{level}' page {page}: {e})")
+                else:
+                    time.sleep(1.5 * (attempt + 1))
+        if data is None:
+            break
         results = data.get("results", [])
         if not results:
             break
@@ -358,28 +368,37 @@ def main():
     print(f"Loaded {len(companies_by_name)} known companies for logo lookup")
 
     seen_ids = set()
+    company_counts = {}
     rows = []
-    for level in LEVELS:
-        count_for_level = 0
-        for raw in fetch_level(level, PAGES_PER_LEVEL):
+
+    queries = [(level, category) for level in LEVELS for category in CATEGORIES]
+    random.shuffle(queries)  # avoid always exhausting the same early categories first as TARGET_COUNT is hit
+
+    for level, category in queries:
+        if len(rows) >= TARGET_COUNT:
+            break
+        count_for_query = 0
+        for raw in fetch_query(level, category, PAGES_PER_QUERY):
             if len(rows) >= TARGET_COUNT:
                 break
             if raw["id"] in seen_ids:
+                continue
+            company_name = raw.get("company", {}).get("name", "").strip()
+            if not raw.get("name") or not company_name:
+                continue
+            if company_counts.get(company_name, 0) >= MAX_PER_COMPANY:
                 continue
             locations = raw.get("locations") or []
             location_name = locations[0]["name"] if locations else ""
             if not is_us_location(location_name):
                 continue
-            if not raw.get("name") or not raw.get("company", {}).get("name"):
-                continue
             seen_ids.add(raw["id"])
+            company_counts[company_name] = company_counts.get(company_name, 0) + 1
             rows.append(build_job_row(raw, level, companies_by_name))
-            count_for_level += 1
-        print(f"Level '{level}': collected {count_for_level} US-based listings")
-        if len(rows) >= TARGET_COUNT:
-            break
+            count_for_query += 1
+        print(f"'{category}' / '{level}': collected {count_for_query}")
 
-    print(f"Total listings to upsert: {len(rows)}")
+    print(f"Total listings to upsert: {len(rows)} across {len(company_counts)} distinct companies")
     with_logo = sum(1 for r in rows if r["logo_url"])
     print(f"  with matched real logo: {with_logo} ({with_logo * 100 // max(len(rows),1)}%)")
     with_salary = sum(1 for r in rows if r["salary_range"])
@@ -388,8 +407,17 @@ def main():
     print(f"  with responsibilities: {with_resp}")
     with_qual = sum(1 for r in rows if r["qualifications"])
     print(f"  with qualifications: {with_qual}")
+    top_companies = sorted(company_counts.items(), key=lambda kv: -kv[1])[:10]
+    print(f"  top companies: {top_companies}")
 
     conn = psycopg2.connect(os.environ["DATABASE_URL"])
+    cur = conn.cursor()
+    # The per-company cap only means something against a full refresh - otherwise old
+    # over-represented rows from a prior run (e.g. 100+ Walmart listings) just sit alongside
+    # the new capped batch instead of being replaced by it.
+    cur.execute("DELETE FROM applications WHERE job_id IN (SELECT id FROM jobs WHERE source = 'themuse')")
+    cur.execute("DELETE FROM jobs WHERE source = 'themuse'")
+    conn.commit()
     n = upsert_jobs(conn, rows)
     print(f"Upserted {n} jobs")
 
