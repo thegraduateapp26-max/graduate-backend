@@ -417,6 +417,8 @@ def signup():
 
     if not name or not email or not password:
         return jsonify({"error": "missing fields"}), 400
+    if len(password) < 6:
+        return jsonify({"error": "password must be at least 6 characters"}), 400
 
     role = data.get("role", "graduate")
     valid_roles = ["student", "graduate", "employer", "professor", "recruiter", "high_school_graduate"]
@@ -462,7 +464,8 @@ def signup():
         return jsonify({"status": "account created", "user_id": str(user_id)})
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        print(f"Error: {e}")
+        return jsonify({"error": "An unexpected error occurred."}), 500
 
     finally:
         cur.close()
@@ -684,7 +687,8 @@ def setup_2fa():
         return jsonify({"secret": secret, "otpauthUrl": otpauth_url})
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        print(f"Error: {e}")
+        return jsonify({"error": "An unexpected error occurred."}), 500
 
     finally:
         cur.close()
@@ -722,7 +726,8 @@ def verify_setup_2fa():
         return jsonify({"status": "enabled"})
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        print(f"Error: {e}")
+        return jsonify({"error": "An unexpected error occurred."}), 500
 
     finally:
         cur.close()
@@ -760,7 +765,8 @@ def disable_2fa():
         return jsonify({"status": "disabled"})
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        print(f"Error: {e}")
+        return jsonify({"error": "An unexpected error occurred."}), 500
 
     finally:
         cur.close()
@@ -805,7 +811,8 @@ def change_password():
         return jsonify({"status": "updated"})
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        print(f"Error: {e}")
+        return jsonify({"error": "An unexpected error occurred."}), 500
 
     finally:
         cur.close()
@@ -851,7 +858,8 @@ def change_email():
         return jsonify({"status": "updated", "email": new_email})
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        print(f"Error: {e}")
+        return jsonify({"error": "An unexpected error occurred."}), 500
 
     finally:
         cur.close()
@@ -886,7 +894,8 @@ def switch_to_graduate():
         return jsonify({"status": "updated", "role": "graduate"})
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        print(f"Error: {e}")
+        return jsonify({"error": "An unexpected error occurred."}), 500
 
     finally:
         cur.close()
@@ -1000,7 +1009,8 @@ def delete_account(user_id):
 
     except Exception as e:
         conn.rollback()
-        return jsonify({"error": str(e)}), 500
+        print(f"Error: {e}")
+        return jsonify({"error": "An unexpected error occurred."}), 500
 
     finally:
         cur.close()
@@ -1039,7 +1049,8 @@ def deactivate_account():
 
     except Exception as e:
         conn.rollback()
-        return jsonify({"error": str(e)}), 500
+        print(f"Error: {e}")
+        return jsonify({"error": "An unexpected error occurred."}), 500
 
     finally:
         cur.close()
@@ -1084,7 +1095,8 @@ def forgot_password():
         return jsonify({"status": "sent"})
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        print(f"Error: {e}")
+        return jsonify({"error": "An unexpected error occurred."}), 500
 
     finally:
         cur.close()
@@ -1126,7 +1138,8 @@ def reset_password():
         return jsonify({"status": "updated"})
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        print(f"Error: {e}")
+        return jsonify({"error": "An unexpected error occurred."}), 500
 
     finally:
         cur.close()
@@ -1264,7 +1277,8 @@ def update_user(user_id):
         return jsonify({"status": "updated", "user": result})
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        print(f"Error: {e}")
+        return jsonify({"error": "An unexpected error occurred."}), 500
 
     finally:
         cur.close()
@@ -1304,7 +1318,8 @@ def update_user_verification(user_id):
         return jsonify({"status": "updated", "id": str(updated['id']), "verificationStatus": updated['verification_status']})
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        print(f"Error: {e}")
+        return jsonify({"error": "An unexpected error occurred."}), 500
 
     finally:
         cur.close()
@@ -1344,7 +1359,8 @@ def update_user_badge(user_id):
         return jsonify({"status": "updated", "id": str(updated['id']), "customBadge": updated['custom_badge']})
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        print(f"Error: {e}")
+        return jsonify({"error": "An unexpected error occurred."}), 500
 
     finally:
         cur.close()
@@ -1385,6 +1401,7 @@ def get_connection_status(user_id):
 
 
 @app.post("/api/users/<user_id>/connect")
+@limiter.limit("20 per minute")
 def request_connection(user_id):
     current_user = get_current_user()
     if not current_user:
@@ -1421,7 +1438,8 @@ def request_connection(user_id):
         return jsonify({"status": "pending_sent", "connectionId": str(result['id'])})
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        print(f"Error: {e}")
+        return jsonify({"error": "An unexpected error occurred."}), 500
 
     finally:
         cur.close()
@@ -1458,7 +1476,8 @@ def respond_to_connection(connection_id):
         return jsonify({"status": "updated", "id": str(updated['id']), "connectionStatus": updated['status']})
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        print(f"Error: {e}")
+        return jsonify({"error": "An unexpected error occurred."}), 500
 
     finally:
         cur.close()
@@ -1629,6 +1648,7 @@ def get_message_thread(other_user_id):
 
 
 @app.post("/api/messages/<other_user_id>")
+@limiter.limit("30 per minute")
 def send_message(other_user_id):
     current_user = get_current_user()
     if not current_user:
@@ -1663,7 +1683,8 @@ def send_message(other_user_id):
         })
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        print(f"Error: {e}")
+        return jsonify({"error": "An unexpected error occurred."}), 500
 
     finally:
         cur.close()
@@ -1715,6 +1736,7 @@ def list_endorsements(user_id):
 
 
 @app.post("/api/users/<user_id>/endorsements")
+@limiter.limit("20 per minute")
 def create_endorsement(user_id):
     author_id = get_current_user()
     if not author_id:
@@ -1760,7 +1782,8 @@ def create_endorsement(user_id):
         })
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        print(f"Error: {e}")
+        return jsonify({"error": "An unexpected error occurred."}), 500
 
     finally:
         cur.close()
@@ -1796,7 +1819,8 @@ def update_endorsement(endorsement_id):
         return jsonify({"status": "updated", "id": str(updated['id']), "visible": updated['visible']})
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        print(f"Error: {e}")
+        return jsonify({"error": "An unexpected error occurred."}), 500
 
     finally:
         cur.close()
@@ -1845,6 +1869,7 @@ def list_feed_posts():
 
 
 @app.post("/api/feed")
+@limiter.limit("15 per minute")
 def create_feed_post():
     author_id = get_current_user()
     if not author_id:
@@ -1889,7 +1914,8 @@ def create_feed_post():
         })
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        print(f"Error: {e}")
+        return jsonify({"error": "An unexpected error occurred."}), 500
 
     finally:
         cur.close()
@@ -1928,7 +1954,8 @@ def edit_feed_post(post_id):
         return jsonify({"status": "updated", "content": updated['content']})
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        print(f"Error: {e}")
+        return jsonify({"error": "An unexpected error occurred."}), 500
 
     finally:
         cur.close()
@@ -1961,7 +1988,8 @@ def delete_feed_post(post_id):
         return jsonify({"status": "deleted"})
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        print(f"Error: {e}")
+        return jsonify({"error": "An unexpected error occurred."}), 500
 
     finally:
         cur.close()
@@ -1972,6 +2000,7 @@ def delete_feed_post(post_id):
 # FEED POST LIKES
 # -----------------------------
 @app.post("/api/feed/<post_id>/like")
+@limiter.limit("60 per minute")
 def toggle_post_like(post_id):
     user_id = get_current_user()
     if not user_id:
@@ -1999,7 +2028,8 @@ def toggle_post_like(post_id):
         return jsonify({"status": "updated", "likedByMe": liked, "likesCount": count})
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        print(f"Error: {e}")
+        return jsonify({"error": "An unexpected error occurred."}), 500
 
     finally:
         cur.close()
@@ -2037,6 +2067,7 @@ def list_post_comments(post_id):
 
 
 @app.post("/api/feed/<post_id>/comments")
+@limiter.limit("20 per minute")
 def create_post_comment(post_id):
     author_id = get_current_user()
     if not author_id:
@@ -2077,7 +2108,8 @@ def create_post_comment(post_id):
         })
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        print(f"Error: {e}")
+        return jsonify({"error": "An unexpected error occurred."}), 500
 
     finally:
         cur.close()
@@ -2178,7 +2210,8 @@ def create_job():
         return jsonify({"status": "job created", "job_id": str(result['id'])})
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        print(f"Error: {e}")
+        return jsonify({"error": "An unexpected error occurred."}), 500
 
     finally:
         cur.close()
@@ -2215,7 +2248,8 @@ def update_job(job_id):
         return jsonify({"status": "updated", "id": str(updated['id']), "isActive": updated['is_active']})
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        print(f"Error: {e}")
+        return jsonify({"error": "An unexpected error occurred."}), 500
 
     finally:
         cur.close()
@@ -2255,7 +2289,8 @@ def apply_to_job():
         return jsonify({"error": "already applied"}), 400
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        print(f"Error: {e}")
+        return jsonify({"error": "An unexpected error occurred."}), 500
 
     finally:
         cur.close()
@@ -2373,7 +2408,8 @@ def create_scholarship():
         return jsonify({"status": "scholarship created", "scholarship_id": str(result['id'])})
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        print(f"Error: {e}")
+        return jsonify({"error": "An unexpected error occurred."}), 500
 
     finally:
         cur.close()
@@ -2397,7 +2433,8 @@ def delete_scholarship(scholarship_id):
         conn.commit()
         return jsonify({"status": "deleted"})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        print(f"Error: {e}")
+        return jsonify({"error": "An unexpected error occurred."}), 500
     finally:
         cur.close()
         conn.close()
@@ -2453,7 +2490,8 @@ def create_spotlight():
 
     except Exception as e:
         conn.rollback()
-        return jsonify({"error": str(e)}), 500
+        print(f"Error: {e}")
+        return jsonify({"error": "An unexpected error occurred."}), 500
 
     finally:
         cur.close()
@@ -2572,7 +2610,8 @@ def delete_spotlight(spotlight_id):
 
     except Exception as e:
         conn.rollback()
-        return jsonify({"error": str(e)}), 500
+        print(f"Error: {e}")
+        return jsonify({"error": "An unexpected error occurred."}), 500
 
     finally:
         cur.close()
@@ -2603,7 +2642,8 @@ def view_spotlight(spotlight_id):
 
     except Exception as e:
         conn.rollback()
-        return jsonify({"error": str(e)}), 500
+        print(f"Error: {e}")
+        return jsonify({"error": "An unexpected error occurred."}), 500
 
     finally:
         cur.close()

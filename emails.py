@@ -1,5 +1,6 @@
 import os
 import datetime
+import html
 import resend
 
 resend.api_key = os.environ.get("RESEND_API_KEY")
@@ -8,6 +9,21 @@ FROM_EMAIL = os.environ.get("RESEND_FROM_EMAIL", "The Graduate <hello@thegraduat
 APP_URL = os.environ.get("APP_URL", "https://thegraduate.io/app")
 
 BRAND_COLOR = "#4f46e5"
+
+
+def _esc(value) -> str:
+    """Escapes user/employer-controlled text before it's interpolated into an HTML email body -
+    e.g. a job title or company name (set by an employer account) reaching another user's inbox
+    via the job-match email, unescaped, would let that employer inject arbitrary HTML/links."""
+    return html.escape(str(value if value is not None else ""), quote=True)
+
+
+def _safe_url(url, fallback: str) -> str:
+    """Only allows http(s) links in an href - blocks javascript: URIs and (via html.escape)
+    attribute-breakout from employer-controlled job URLs."""
+    if url and str(url).strip().lower().startswith(("http://", "https://")):
+        return html.escape(str(url), quote=True)
+    return fallback
 
 
 def _wrap(inner_html: str) -> str:
@@ -116,7 +132,7 @@ _ROLE_CONTENT = {
 
 def send_welcome_email(name: str, email: str, role: str = "graduate"):
     content = _ROLE_CONTENT.get(role, _ROLE_CONTENT["graduate"])
-    first_name = (name or "").split(" ")[0] or name
+    first_name = _esc((name or "").split(" ")[0] or name)
 
     inner = f"""
       <h1 style="font-size:24px; color:#0f172a; margin:0 0 8px;">Welcome to Graduate, {first_name} 🎓</h1>
@@ -140,19 +156,20 @@ def send_welcome_email(name: str, email: str, role: str = "graduate"):
 def send_job_matches_email(name: str, email: str, matches: list):
     rows = ""
     for job in matches:
-        location = job.get("location") or "Remote"
+        location = _esc(job.get("location") or "Remote")
         salary = job.get("salary_range")
-        salary_html = f'<span style="color:#94a3b8;">&middot; {salary}</span>' if salary else ""
+        salary_html = f'<span style="color:#94a3b8;">&middot; {_esc(salary)}</span>' if salary else ""
+        job_url = _safe_url(job.get('url'), f"{APP_URL}?view=jobs")
         rows += f"""
         <div style="border:1px solid #f1f5f9; border-radius:12px; padding:16px; margin-bottom:12px;">
-          <p style="margin:0 0 4px; font-weight:800; color:#0f172a; font-size:15px;">{job.get('title')}</p>
-          <p style="margin:0 0 8px; color:#64748b; font-size:13px;">{job.get('company')} &middot; {location} {salary_html}</p>
-          {_button("View Job", job.get('url') or f"{APP_URL}?view=jobs")}
+          <p style="margin:0 0 4px; font-weight:800; color:#0f172a; font-size:15px;">{_esc(job.get('title'))}</p>
+          <p style="margin:0 0 8px; color:#64748b; font-size:13px;">{_esc(job.get('company'))} &middot; {location} {salary_html}</p>
+          {_button("View Job", job_url)}
         </div>
         """
 
     inner = f"""
-      <h1 style="font-size:22px; color:#0f172a; margin:0 0 12px;">Your top job matches, {name}</h1>
+      <h1 style="font-size:22px; color:#0f172a; margin:0 0 12px;">Your top job matches, {_esc(name)}</h1>
       <p style="color:#475569; font-size:14px; line-height:1.6; margin:0 0 20px;">
         Based on your major and skills, here are your top {len(matches)} matches on Graduate right now.
       </p>
@@ -168,9 +185,9 @@ def send_job_matches_email(name: str, email: str, matches: list):
 
 def send_graduation_reminder_email(name: str, email: str, grad_date_label: str):
     inner = f"""
-      <h1 style="font-size:22px; color:#0f172a; margin:0 0 12px;">Your graduation is coming up, {name}!</h1>
+      <h1 style="font-size:22px; color:#0f172a; margin:0 0 12px;">Your graduation is coming up, {_esc(name)}!</h1>
       <p style="color:#475569; font-size:14px; line-height:1.6; margin:0 0 12px;">
-        You told us you're set to graduate around <strong>{grad_date_label}</strong> - that's about a
+        You told us you're set to graduate around <strong>{_esc(grad_date_label)}</strong> - that's about a
         month away. We're reaching out now because your school email may stop working once you
         graduate, and we don't want you to lose access to your Graduate account.
       </p>
@@ -199,10 +216,10 @@ def send_password_reset_email(name: str, email: str, reset_url: str):
     inner = f"""
       <h1 style="font-size:22px; color:#0f172a; margin:0 0 12px;">Reset your password</h1>
       <p style="color:#475569; font-size:14px; line-height:1.6; margin:0 0 4px;">
-        Hi {name}, we received a request to reset your Graduate password. This link expires in
+        Hi {_esc(name)}, we received a request to reset your Graduate password. This link expires in
         1 hour. If you didn't request this, you can safely ignore this email.
       </p>
-      {_button("Reset Password", reset_url)}
+      {_button("Reset Password", _safe_url(reset_url, f"{APP_URL}?view=forgot-password"))}
     """
     return resend.Emails.send({
         "from": FROM_EMAIL,
