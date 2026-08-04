@@ -8,6 +8,7 @@ referencing the company name against public/data/companies.json for a real logo.
 Usage:
     DATABASE_URL=postgresql://... python3 scripts/ingest_jobs.py
 """
+import io
 import json
 import os
 import random
@@ -18,6 +19,7 @@ import psycopg2
 import psycopg2.extras
 import requests
 from bs4 import BeautifulSoup, NavigableString
+from PIL import Image
 
 API_URL = "https://www.themuse.com/api/public/jobs"
 LEVELS = ["Internship", "Entry Level"]
@@ -130,6 +132,9 @@ def favicon_url(domain, size=128):
 _GENERIC_FAVICON_BYTES = None
 
 
+MIN_REAL_LOGO_SIZE = 48  # matches LogoImg's client-side floor - below this it looks pixelated once scaled up to card/modal size
+
+
 def _is_real_favicon(content):
     """Google serves a byte-identical generic globe icon whenever it has nothing for a
     domain - fetching a guaranteed-fake domain once gives a reference to diff against,
@@ -141,7 +146,13 @@ def _is_real_favicon(content):
             _GENERIC_FAVICON_BYTES = resp.content
         except requests.exceptions.RequestException:
             _GENERIC_FAVICON_BYTES = b""
-    return content != _GENERIC_FAVICON_BYTES
+    if content == _GENERIC_FAVICON_BYTES:
+        return False
+    try:
+        width, _ = Image.open(io.BytesIO(content)).size
+    except Exception:
+        return False
+    return width >= MIN_REAL_LOGO_SIZE
 
 
 def guess_domain_candidates(name):
