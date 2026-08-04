@@ -102,14 +102,74 @@ def normalize_company_name(name):
     return n
 
 
-def logo_url_for(company_name, companies_by_name):
+def favicon_url(domain, size=128):
+    # Google's favicon service serves whatever resolution the site's own icon actually is
+    # (confirmed up to 150px+ for many real companies) instead of DuckDuckGo's fixed 32x32,
+    # which is what was making every logo on the site look blurry.
+    return f"https://www.google.com/s2/favicons?domain={domain}&sz={size}"
+
+
+_GENERIC_FAVICON_BYTES = None
+
+
+def _is_real_favicon(content):
+    """Google serves a byte-identical generic globe icon whenever it has nothing for a
+    domain - fetching a guaranteed-fake domain once gives a reference to diff against,
+    which is far more reliable than guessing from image dimensions/content-length."""
+    global _GENERIC_FAVICON_BYTES
+    if _GENERIC_FAVICON_BYTES is None:
+        try:
+            resp = requests.get(favicon_url("zz-definitely-fake-domain-99999.com"), timeout=10)
+            _GENERIC_FAVICON_BYTES = resp.content
+        except requests.exceptions.RequestException:
+            _GENERIC_FAVICON_BYTES = b""
+    return content != _GENERIC_FAVICON_BYTES
+
+
+def guess_domain_candidates(name):
+    n = re.sub(r"[,.]", "", name.strip())
+    n = re.sub(r"\b(inc|llc|ltd|corp|corporation|co|group|holdings|company|companies)\b", "", n, flags=re.I).strip()
+    words = re.findall(r"[a-zA-Z0-9]+", n)
+    if not words:
+        return []
+    candidates = ["".join(w.lower() for w in words) + ".com"]
+    if len(words) > 1:
+        candidates.append("-".join(w.lower() for w in words) + ".com")
+    return candidates
+
+
+_domain_verify_cache = {}
+
+
+def find_logo_domain(company_name, companies_by_name):
+    """Curated companies.json entries are trusted outright (a human verified those domains).
+    For everything else, guesses a domain from the company name and only accepts it if
+    Google actually has a real (non-generic) favicon for it - better coverage than the
+    curated list alone, without just making up a logo for a domain that doesn't exist."""
     key = company_name.strip().lower()
-    domain = companies_by_name.get(key)
-    if not domain:
-        domain = companies_by_name.get(normalize_company_name(company_name))
+    domain = companies_by_name.get(key) or companies_by_name.get(normalize_company_name(company_name))
     if domain:
-        return f"https://icons.duckduckgo.com/ip3/{domain}.ico"
-    return None
+        return domain
+
+    if company_name in _domain_verify_cache:
+        return _domain_verify_cache[company_name]
+
+    found = None
+    for candidate in guess_domain_candidates(company_name):
+        try:
+            resp = requests.get(favicon_url(candidate), timeout=10)
+            if resp.ok and _is_real_favicon(resp.content):
+                found = candidate
+                break
+        except requests.exceptions.RequestException:
+            continue
+    _domain_verify_cache[company_name] = found
+    return found
+
+
+def logo_url_for(company_name, companies_by_name):
+    domain = find_logo_domain(company_name, companies_by_name)
+    return favicon_url(domain) if domain else None
 
 
 def is_us_location(name):
