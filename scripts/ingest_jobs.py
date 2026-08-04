@@ -32,8 +32,8 @@ CATEGORIES = [
     "Customer Service", "Administration and Office", "Healthcare", "Education",
     "Transportation and Logistics", "Food and Hospitality Services",
 ]
-PAGES_PER_QUERY = 8  # ~20 results/page; multiplied by len(CATEGORIES) so kept modest
-MAX_PER_COMPANY = 6  # prevents one high-volume poster (e.g. Walmart, CVS) from crowding out everyone else
+PAGES_PER_QUERY = 40  # ~20 results/page; the organized-listing filter rejects a lot, so needs real depth to reach TARGET_COUNT
+MAX_PER_COMPANY = 12  # prevents one high-volume poster (e.g. Walmart, CVS) from crowding out everyone else
 PRIORITY_MAX_PER_COMPANY = 8  # slightly higher cap for named brand-recognition pulls below
 TARGET_COUNT = 500
 
@@ -92,7 +92,7 @@ PREFERRED_HEADERS = re.compile(
     re.I,
 )
 QUALIFICATION_HEADERS = re.compile(
-    r"qualif|requirement|who you are|what you bring|what we.?re looking for|your background|skills? (you|needed)|basic qualifications|minimum qualifications",
+    r"qualif|require|who you are|what you bring|what we.?re looking for|your background|skills? (you|needed)|education and experience",
     re.I,
 )
 ABOUT_HEADERS = re.compile(
@@ -454,9 +454,15 @@ def upsert_jobs(conn, rows):
 
 
 def is_organized(row):
-    """Only listings with both a responsibilities and a qualifications section parsed out
-    count as "organized" - a title/location with nothing else isn't worth showing users."""
-    return bool(row["key_responsibilities"]) and bool(row["qualifications"])
+    """A title/location with no real content isn't worth showing users, but requiring BOTH
+    responsibilities and qualifications to have parsed out successfully turned out to reject
+    plenty of genuinely well-written postings just because they use header wording (or skip
+    one section entirely) that the parser doesn't happen to catch - real companies vary their
+    templates too much for that to be a reliable "is this organized" signal on its own. A
+    structured list (either one) plus a real, substantial description is a better bar."""
+    has_structure = bool(row["key_responsibilities"]) or bool(row["qualifications"])
+    has_real_description = bool(row["description"]) and len(row["description"]) >= 300
+    return has_structure and has_real_description
 
 
 def _consider(raw, level, companies_by_name, seen_ids, company_counts, rows, max_per_company):
