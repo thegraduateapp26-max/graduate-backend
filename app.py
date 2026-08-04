@@ -5,6 +5,8 @@ import bcrypt
 import jwt
 import pyotp
 import psycopg2
+import sentry_sdk
+from sentry_sdk.integrations.flask import FlaskIntegration
 from psycopg2.extras import RealDictCursor, Json
 from google.oauth2 import id_token as google_id_token
 from google.auth.transport import requests as google_requests
@@ -17,6 +19,17 @@ from flask_limiter.util import get_remote_address
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 import emails
+
+# No-op until SENTRY_DSN is set (unset in dev/tests, so this never fires there) - see
+# tests/README.md / launch checklist for the account-creation step this depends on.
+SENTRY_DSN = os.environ.get("SENTRY_DSN")
+if SENTRY_DSN:
+    sentry_sdk.init(
+        dsn=SENTRY_DSN,
+        integrations=[FlaskIntegration()],
+        traces_sample_rate=0.1,
+        environment=os.environ.get("RAILWAY_ENVIRONMENT_NAME", "production"),
+    )
 
 
 app = Flask(__name__, static_folder="static", static_url_path="/static")
@@ -401,6 +414,7 @@ def status():
         conn.close()
         return jsonify({"status": "ok", "database": "connected"})
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         return jsonify({"status": "error", "database": str(e)}), 500
 
 
@@ -464,6 +478,7 @@ def signup():
         return jsonify({"status": "account created", "user_id": str(user_id)})
 
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         print(f"Error: {e}")
         return jsonify({"error": "An unexpected error occurred."}), 500
 
@@ -687,6 +702,7 @@ def setup_2fa():
         return jsonify({"secret": secret, "otpauthUrl": otpauth_url})
 
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         print(f"Error: {e}")
         return jsonify({"error": "An unexpected error occurred."}), 500
 
@@ -726,6 +742,7 @@ def verify_setup_2fa():
         return jsonify({"status": "enabled"})
 
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         print(f"Error: {e}")
         return jsonify({"error": "An unexpected error occurred."}), 500
 
@@ -765,6 +782,7 @@ def disable_2fa():
         return jsonify({"status": "disabled"})
 
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         print(f"Error: {e}")
         return jsonify({"error": "An unexpected error occurred."}), 500
 
@@ -811,6 +829,7 @@ def change_password():
         return jsonify({"status": "updated"})
 
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         print(f"Error: {e}")
         return jsonify({"error": "An unexpected error occurred."}), 500
 
@@ -858,6 +877,7 @@ def change_email():
         return jsonify({"status": "updated", "email": new_email})
 
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         print(f"Error: {e}")
         return jsonify({"error": "An unexpected error occurred."}), 500
 
@@ -894,6 +914,7 @@ def switch_to_graduate():
         return jsonify({"status": "updated", "role": "graduate"})
 
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         print(f"Error: {e}")
         return jsonify({"error": "An unexpected error occurred."}), 500
 
@@ -1009,6 +1030,7 @@ def delete_account(user_id):
 
     except Exception as e:
         conn.rollback()
+        sentry_sdk.capture_exception(e)
         print(f"Error: {e}")
         return jsonify({"error": "An unexpected error occurred."}), 500
 
@@ -1049,6 +1071,7 @@ def deactivate_account():
 
     except Exception as e:
         conn.rollback()
+        sentry_sdk.capture_exception(e)
         print(f"Error: {e}")
         return jsonify({"error": "An unexpected error occurred."}), 500
 
@@ -1095,6 +1118,7 @@ def forgot_password():
         return jsonify({"status": "sent"})
 
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         print(f"Error: {e}")
         return jsonify({"error": "An unexpected error occurred."}), 500
 
@@ -1138,6 +1162,7 @@ def reset_password():
         return jsonify({"status": "updated"})
 
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         print(f"Error: {e}")
         return jsonify({"error": "An unexpected error occurred."}), 500
 
@@ -1277,6 +1302,7 @@ def update_user(user_id):
         return jsonify({"status": "updated", "user": result})
 
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         print(f"Error: {e}")
         return jsonify({"error": "An unexpected error occurred."}), 500
 
@@ -1318,6 +1344,7 @@ def update_user_verification(user_id):
         return jsonify({"status": "updated", "id": str(updated['id']), "verificationStatus": updated['verification_status']})
 
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         print(f"Error: {e}")
         return jsonify({"error": "An unexpected error occurred."}), 500
 
@@ -1359,6 +1386,7 @@ def update_user_badge(user_id):
         return jsonify({"status": "updated", "id": str(updated['id']), "customBadge": updated['custom_badge']})
 
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         print(f"Error: {e}")
         return jsonify({"error": "An unexpected error occurred."}), 500
 
@@ -1438,6 +1466,7 @@ def request_connection(user_id):
         return jsonify({"status": "pending_sent", "connectionId": str(result['id'])})
 
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         print(f"Error: {e}")
         return jsonify({"error": "An unexpected error occurred."}), 500
 
@@ -1476,6 +1505,7 @@ def respond_to_connection(connection_id):
         return jsonify({"status": "updated", "id": str(updated['id']), "connectionStatus": updated['status']})
 
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         print(f"Error: {e}")
         return jsonify({"error": "An unexpected error occurred."}), 500
 
@@ -1683,6 +1713,7 @@ def send_message(other_user_id):
         })
 
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         print(f"Error: {e}")
         return jsonify({"error": "An unexpected error occurred."}), 500
 
@@ -1782,6 +1813,7 @@ def create_endorsement(user_id):
         })
 
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         print(f"Error: {e}")
         return jsonify({"error": "An unexpected error occurred."}), 500
 
@@ -1819,6 +1851,7 @@ def update_endorsement(endorsement_id):
         return jsonify({"status": "updated", "id": str(updated['id']), "visible": updated['visible']})
 
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         print(f"Error: {e}")
         return jsonify({"error": "An unexpected error occurred."}), 500
 
@@ -1914,6 +1947,7 @@ def create_feed_post():
         })
 
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         print(f"Error: {e}")
         return jsonify({"error": "An unexpected error occurred."}), 500
 
@@ -1954,6 +1988,7 @@ def edit_feed_post(post_id):
         return jsonify({"status": "updated", "content": updated['content']})
 
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         print(f"Error: {e}")
         return jsonify({"error": "An unexpected error occurred."}), 500
 
@@ -1988,6 +2023,7 @@ def delete_feed_post(post_id):
         return jsonify({"status": "deleted"})
 
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         print(f"Error: {e}")
         return jsonify({"error": "An unexpected error occurred."}), 500
 
@@ -2028,6 +2064,7 @@ def toggle_post_like(post_id):
         return jsonify({"status": "updated", "likedByMe": liked, "likesCount": count})
 
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         print(f"Error: {e}")
         return jsonify({"error": "An unexpected error occurred."}), 500
 
@@ -2108,6 +2145,7 @@ def create_post_comment(post_id):
         })
 
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         print(f"Error: {e}")
         return jsonify({"error": "An unexpected error occurred."}), 500
 
@@ -2210,6 +2248,7 @@ def create_job():
         return jsonify({"status": "job created", "job_id": str(result['id'])})
 
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         print(f"Error: {e}")
         return jsonify({"error": "An unexpected error occurred."}), 500
 
@@ -2248,6 +2287,7 @@ def update_job(job_id):
         return jsonify({"status": "updated", "id": str(updated['id']), "isActive": updated['is_active']})
 
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         print(f"Error: {e}")
         return jsonify({"error": "An unexpected error occurred."}), 500
 
@@ -2289,6 +2329,7 @@ def apply_to_job():
         return jsonify({"error": "already applied"}), 400
 
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         print(f"Error: {e}")
         return jsonify({"error": "An unexpected error occurred."}), 500
 
@@ -2408,6 +2449,7 @@ def create_scholarship():
         return jsonify({"status": "scholarship created", "scholarship_id": str(result['id'])})
 
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         print(f"Error: {e}")
         return jsonify({"error": "An unexpected error occurred."}), 500
 
@@ -2433,6 +2475,7 @@ def delete_scholarship(scholarship_id):
         conn.commit()
         return jsonify({"status": "deleted"})
     except Exception as e:
+        sentry_sdk.capture_exception(e)
         print(f"Error: {e}")
         return jsonify({"error": "An unexpected error occurred."}), 500
     finally:
@@ -2490,6 +2533,7 @@ def create_spotlight():
 
     except Exception as e:
         conn.rollback()
+        sentry_sdk.capture_exception(e)
         print(f"Error: {e}")
         return jsonify({"error": "An unexpected error occurred."}), 500
 
@@ -2610,6 +2654,7 @@ def delete_spotlight(spotlight_id):
 
     except Exception as e:
         conn.rollback()
+        sentry_sdk.capture_exception(e)
         print(f"Error: {e}")
         return jsonify({"error": "An unexpected error occurred."}), 500
 
@@ -2642,6 +2687,7 @@ def view_spotlight(spotlight_id):
 
     except Exception as e:
         conn.rollback()
+        sentry_sdk.capture_exception(e)
         print(f"Error: {e}")
         return jsonify({"error": "An unexpected error occurred."}), 500
 

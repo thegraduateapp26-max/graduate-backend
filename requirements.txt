@@ -11,3 +11,4 @@ Flask-Limiter==3.8.0
 google-auth==2.35.0
 requests==2.33.0
 beautifulsoup4==4.14.3
+sentry-sdk[flask]==2.66.1
