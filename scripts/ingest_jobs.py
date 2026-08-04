@@ -132,9 +132,15 @@ def guess_domain_candidates(name):
     words = re.findall(r"[a-zA-Z0-9]+", n)
     if not words:
         return []
-    candidates = ["".join(w.lower() for w in words) + ".com"]
+    joined = "".join(w.lower() for w in words)
+    candidates = [joined + ".com", joined + ".org"]
     if len(words) > 1:
         candidates.append("-".join(w.lower() for w in words) + ".com")
+    # Deliberately not guessing from just the first word (e.g. "Sandia" out of "Sandia
+    # National Laboratories") even though it would catch a few more institutions - a short
+    # generic first word ("Enterprise", "National"...) is too likely to collide with an
+    # unrelated real site that happens to have its own real favicon, which the "is this a
+    # real favicon" check can't catch since it would be a genuine (just wrong) logo.
     return candidates
 
 
