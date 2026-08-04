@@ -32,9 +32,20 @@ CATEGORIES = [
     "Customer Service", "Administration and Office", "Healthcare", "Education",
     "Transportation and Logistics", "Food and Hospitality Services",
 ]
-PAGES_PER_QUERY = 6  # ~20 results/page; multiplied by len(CATEGORIES) so kept modest
+PAGES_PER_QUERY = 8  # ~20 results/page; multiplied by len(CATEGORIES) so kept modest
 MAX_PER_COMPANY = 6  # prevents one high-volume poster (e.g. Walmart, CVS) from crowding out everyone else
-TARGET_COUNT = 350
+PRIORITY_MAX_PER_COMPANY = 8  # slightly higher cap for named brand-recognition pulls below
+TARGET_COUNT = 500
+
+# Well-known brands confirmed (by hand, via the API) to actually have current internship/entry
+# -level listings on The Muse - queried by name in addition to the category sampling below,
+# since a handful of big employers don't reliably surface through category/level alone.
+# Some requested brands (BNY Mellon, Duolingo) have zero current listings on this source as of
+# writing and are deliberately left out rather than faked.
+PRIORITY_COMPANIES = [
+    "PNC", "Salesforce", "Mastercard", "IBM", "Wells Fargo", "Bank of America",
+    "Visa", "Charles Schwab", "Capital One", "Fidelity Investments",
+]
 
 COMPANIES_JSON = os.path.join(
     os.path.dirname(__file__), "..", "..",
@@ -73,8 +84,15 @@ RESPONSIBILITY_HEADERS = re.compile(
     r"responsibilit|what you.?ll do|day.to.day|duties|your role|the role|what you.?ll be doing|impact",
     re.I,
 )
+# Checked before QUALIFICATION_HEADERS - "Preferred Qualifications" would otherwise match the
+# generic "qualif" pattern below and get lumped in with required qualifications, which is
+# exactly the "everything mixed together" mess this field split is meant to fix.
+PREFERRED_HEADERS = re.compile(
+    r"preferred|nice.to.have|bonus points|a plus|ideal candidate",
+    re.I,
+)
 QUALIFICATION_HEADERS = re.compile(
-    r"qualif|requirement|who you are|what you bring|what we.?re looking for|your background|skills? (you|needed)|basic qualifications|minimum qualifications|preferred",
+    r"qualif|requirement|who you are|what you bring|what we.?re looking for|your background|skills? (you|needed)|basic qualifications|minimum qualifications",
     re.I,
 )
 ABOUT_HEADERS = re.compile(
@@ -196,6 +214,8 @@ def classify_header(text):
         return "about"
     if RESPONSIBILITY_HEADERS.search(text):
         return "responsibilities"
+    if PREFERRED_HEADERS.search(text):
+        return "preferred_qualifications"
     if QUALIFICATION_HEADERS.search(text):
         return "qualifications"
     return None
@@ -278,7 +298,7 @@ def parse_contents(html):
     soup = BeautifulSoup(html or "", "html.parser")
     lines = group_lines(iter_runs(soup))
 
-    sections = {"summary": [], "responsibilities": [], "qualifications": [], "about": [], "other": []}
+    sections = {"summary": [], "responsibilities": [], "qualifications": [], "preferred_qualifications": [], "about": [], "other": []}
     current = "summary"
     for kind, leading_bold, text in lines:
         if kind == "li":
@@ -302,6 +322,7 @@ def parse_contents(html):
     about_company = " ".join(sections["about"])[:1200] or None
     responsibilities = sections["responsibilities"][:10]
     qualifications = sections["qualifications"][:10]
+    preferred_qualifications = sections["preferred_qualifications"][:10]
 
     full_text = clean_text(soup)
     return {
@@ -309,6 +330,7 @@ def parse_contents(html):
         "job_summary": job_summary,
         "key_responsibilities": responsibilities,
         "qualifications": qualifications,
+        "preferred_qualifications": preferred_qualifications,
         "about_company": about_company,
     }
 
@@ -318,18 +340,18 @@ def extract_salary(text):
     return m.group(0).strip() if m else None
 
 
-def fetch_query(level, category, pages):
+def fetch_query(params, pages, label):
     for page in range(pages):
         data = None
         for attempt in range(3):
             try:
-                resp = requests.get(API_URL, params={"level": level, "category": category, "page": page}, timeout=20)
+                resp = requests.get(API_URL, params={**params, "page": page}, timeout=20)
                 resp.raise_for_status()
                 data = resp.json()
                 break
             except requests.exceptions.RequestException as e:
                 if attempt == 2:
-                    print(f"  (giving up on '{category}'/'{level}' page {page}: {e})")
+                    print(f"  (giving up on {label} page {page}: {e})")
                 else:
                     time.sleep(1.5 * (attempt + 1))
         if data is None:
@@ -384,6 +406,7 @@ def build_job_row(raw, level_name, companies_by_name):
         "job_summary": parsed["job_summary"],
         "key_responsibilities": parsed["key_responsibilities"],
         "qualifications": parsed["qualifications"],
+        "preferred_qualifications": parsed["preferred_qualifications"],
         "about_company": parsed["about_company"],
         "logo_url": logo_url_for(company, companies_by_name),
         "source": "themuse",
@@ -401,13 +424,13 @@ def upsert_jobs(conn, rows):
             INSERT INTO jobs (
                 title, company, location, salary_range, job_type, employment_type, description, url, tags,
                 is_active, job_function, industry, seniority_level, job_summary,
-                key_responsibilities, qualifications, about_company, logo_url,
+                key_responsibilities, qualifications, preferred_qualifications, about_company, logo_url,
                 source, source_id, created_at
             ) VALUES (
                 %(title)s, %(company)s, %(location)s, %(salary_range)s, %(job_type)s, %(employment_type)s,
                 %(description)s, %(url)s, %(tags)s, TRUE, %(job_function)s, %(industry)s,
                 %(seniority_level)s, %(job_summary)s, %(key_responsibilities)s,
-                %(qualifications)s, %(about_company)s, %(logo_url)s, %(source)s,
+                %(qualifications)s, %(preferred_qualifications)s, %(about_company)s, %(logo_url)s, %(source)s,
                 %(source_id)s, COALESCE(%(created_at)s, NOW())
             )
             ON CONFLICT (source, source_id) WHERE source IS NOT NULL DO UPDATE SET
@@ -419,7 +442,8 @@ def upsert_jobs(conn, rows):
                 industry = EXCLUDED.industry, seniority_level = EXCLUDED.seniority_level,
                 job_summary = EXCLUDED.job_summary,
                 key_responsibilities = EXCLUDED.key_responsibilities,
-                qualifications = EXCLUDED.qualifications, about_company = EXCLUDED.about_company,
+                qualifications = EXCLUDED.qualifications, preferred_qualifications = EXCLUDED.preferred_qualifications,
+                about_company = EXCLUDED.about_company,
                 logo_url = EXCLUDED.logo_url
             """,
             r,
@@ -427,6 +451,35 @@ def upsert_jobs(conn, rows):
         inserted += 1
     conn.commit()
     return inserted
+
+
+def is_organized(row):
+    """Only listings with both a responsibilities and a qualifications section parsed out
+    count as "organized" - a title/location with nothing else isn't worth showing users."""
+    return bool(row["key_responsibilities"]) and bool(row["qualifications"])
+
+
+def _consider(raw, level, companies_by_name, seen_ids, company_counts, rows, max_per_company):
+    if len(rows) >= TARGET_COUNT:
+        return False
+    if raw["id"] in seen_ids:
+        return True
+    company_name = raw.get("company", {}).get("name", "").strip()
+    if not raw.get("name") or not company_name:
+        return True
+    if company_counts.get(company_name, 0) >= max_per_company:
+        return True
+    locations = raw.get("locations") or []
+    location_name = locations[0]["name"] if locations else ""
+    if not is_us_location(location_name):
+        return True
+    row = build_job_row(raw, level, companies_by_name)
+    if not is_organized(row):
+        return True
+    seen_ids.add(raw["id"])
+    company_counts[company_name] = company_counts.get(company_name, 0) + 1
+    rows.append(row)
+    return True
 
 
 def main():
@@ -437,32 +490,27 @@ def main():
     company_counts = {}
     rows = []
 
+    print("-- priority brand-name companies --")
+    for company in PRIORITY_COMPANIES:
+        for level in LEVELS:
+            count_before = len(rows)
+            for raw in fetch_query({"company": company, "level": level}, 3, f"company={company}"):
+                if not _consider(raw, level, companies_by_name, seen_ids, company_counts, rows, PRIORITY_MAX_PER_COMPANY):
+                    break
+            print(f"'{company}' / '{level}': collected {len(rows) - count_before}")
+
+    print("-- category sampling --")
     queries = [(level, category) for level in LEVELS for category in CATEGORIES]
     random.shuffle(queries)  # avoid always exhausting the same early categories first as TARGET_COUNT is hit
 
     for level, category in queries:
         if len(rows) >= TARGET_COUNT:
             break
-        count_for_query = 0
-        for raw in fetch_query(level, category, PAGES_PER_QUERY):
-            if len(rows) >= TARGET_COUNT:
+        count_before = len(rows)
+        for raw in fetch_query({"level": level, "category": category}, PAGES_PER_QUERY, f"'{category}'/'{level}'"):
+            if not _consider(raw, level, companies_by_name, seen_ids, company_counts, rows, MAX_PER_COMPANY):
                 break
-            if raw["id"] in seen_ids:
-                continue
-            company_name = raw.get("company", {}).get("name", "").strip()
-            if not raw.get("name") or not company_name:
-                continue
-            if company_counts.get(company_name, 0) >= MAX_PER_COMPANY:
-                continue
-            locations = raw.get("locations") or []
-            location_name = locations[0]["name"] if locations else ""
-            if not is_us_location(location_name):
-                continue
-            seen_ids.add(raw["id"])
-            company_counts[company_name] = company_counts.get(company_name, 0) + 1
-            rows.append(build_job_row(raw, level, companies_by_name))
-            count_for_query += 1
-        print(f"'{category}' / '{level}': collected {count_for_query}")
+        print(f"'{category}' / '{level}': collected {len(rows) - count_before}")
 
     print(f"Total listings to upsert: {len(rows)} across {len(company_counts)} distinct companies")
     with_logo = sum(1 for r in rows if r["logo_url"])
@@ -473,6 +521,12 @@ def main():
     print(f"  with responsibilities: {with_resp}")
     with_qual = sum(1 for r in rows if r["qualifications"])
     print(f"  with qualifications: {with_qual}")
+    with_preferred = sum(1 for r in rows if r["preferred_qualifications"])
+    print(f"  with preferred qualifications: {with_preferred}")
+    with_about = sum(1 for r in rows if r["about_company"])
+    print(f"  with about-company: {with_about}")
+    priority_hits = sorted({r["company"] for r in rows} & {c for c in PRIORITY_COMPANIES})
+    print(f"  priority companies present: {priority_hits}")
     top_companies = sorted(company_counts.items(), key=lambda kv: -kv[1])[:10]
     print(f"  top companies: {top_companies}")
 

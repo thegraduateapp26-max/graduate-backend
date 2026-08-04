@@ -263,6 +263,7 @@ def init_db():
     cur.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS job_summary TEXT;")
     cur.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS key_responsibilities TEXT[];")
     cur.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS qualifications TEXT[];")
+    cur.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS preferred_qualifications TEXT[];")
     cur.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS about_company TEXT;")
     cur.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS logo_url TEXT;")
     cur.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS source TEXT;")
@@ -2166,11 +2167,11 @@ def list_jobs():
         SELECT id, title, company, location, salary_range,
         job_type, description, url, tags, created_at, is_active,
         job_function, industry, seniority_level, job_summary, employment_type,
-        key_responsibilities, qualifications, about_company, logo_url
+        key_responsibilities, qualifications, preferred_qualifications, about_company, logo_url
         FROM jobs
         WHERE is_active = TRUE
         ORDER BY created_at DESC
-        LIMIT 150
+        LIMIT 600
     """)
 
     rows = cur.fetchall()
@@ -2198,6 +2199,7 @@ def list_jobs():
             "jobSummary": r['job_summary'],
             "keyResponsibilities": r['key_responsibilities'] or [],
             "qualifications": r['qualifications'] or [],
+            "preferredQualifications": r['preferred_qualifications'] or [],
             "aboutCompany": r['about_company'],
             "logoUrl": r['logo_url'],
         })
@@ -2230,9 +2232,10 @@ def create_job():
         cur.execute("""
             INSERT INTO jobs (
                 title, company, location, salary_range, job_type, description, url, tags, posted_by,
-                job_function, industry, seniority_level, job_summary, key_responsibilities, qualifications, about_company, logo_url, employment_type
+                job_function, industry, seniority_level, job_summary, key_responsibilities, qualifications,
+                preferred_qualifications, about_company, logo_url, employment_type
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id
         """, (
             data.get("title"), data.get("company"), data.get("location"),
@@ -2240,7 +2243,7 @@ def create_job():
             data.get("url"), data.get("tags"), user_id,
             data.get("jobFunction"), data.get("industry"), data.get("seniorityLevel"),
             data.get("jobSummary"), data.get("keyResponsibilities"), data.get("qualifications"),
-            data.get("aboutCompany"), data.get("logoUrl"), data.get("employmentType"),
+            data.get("preferredQualifications"), data.get("aboutCompany"), data.get("logoUrl"), data.get("employmentType"),
         ))
 
         result = cur.fetchone()
