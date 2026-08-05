@@ -135,16 +135,42 @@ def favicon_url(domain, size=128):
     return f"https://www.google.com/s2/favicons?domain={domain}&sz={size}"
 
 
+LOGO_DEV_TOKEN = os.environ.get("LOGO_DEV_TOKEN", "pk_ZiphmyzEQZ6QGVxdMkZwJQ")
+
+
+def logo_dev_url(domain, size=128):
+    # Logo.dev's curated brand database serves a real, consistently-sized logo for most
+    # companies even when the site's own favicon is tiny (e.g. TikTok/Allstate/SpaceX serve
+    # 16-48px real favicons but Logo.dev has proper 128px+ logos for all three) - preferred
+    # over the raw favicon whenever it has one.
+    return f"https://img.logo.dev/{domain}?token={LOGO_DEV_TOKEN}&size={size}&format=png"
+
+
+def _has_logo_dev_logo(domain):
+    # fallback=404 makes Logo.dev return a real 404 instead of its own generated-letter
+    # placeholder when it doesn't recognize the domain, so this can't mistake "no logo" for
+    # a genuine (if plain) brand mark.
+    try:
+        resp = requests.get(f"{logo_dev_url(domain)}&fallback=404", timeout=10)
+        return resp.status_code == 200
+    except requests.exceptions.RequestException:
+        return False
+
+
 _GENERIC_FAVICON_BYTES = None
-
-
-MIN_REAL_LOGO_SIZE = 64  # matches LogoImg's client-side floor - see its comment for why 64 (retina/2x displays, and Google's favicon service caps out well below what a 128px modal box would need at full crispness regardless)
 
 
 def _is_real_favicon(content):
     """Google serves a byte-identical generic globe icon whenever it has nothing for a
     domain - fetching a guaranteed-fake domain once gives a reference to diff against,
-    which is far more reliable than guessing from image dimensions/content-length."""
+    which is far more reliable than guessing from image dimensions/content-length.
+
+    Deliberately NOT a size check (a real company can have a real domain with a tiny
+    16px favicon - Eaton is one - and rejecting that as "not a real domain" was wrongly
+    blocking logo_url_for() from ever trying Logo.dev for it, which does have a proper
+    logo for plenty of these). Logo quality is handled separately: Logo.dev is preferred
+    when it has the company, and the client-side floor (LogoImg's MIN_REAL_LOGO_SIZE)
+    catches anything that falls through to a too-small raw favicon."""
     global _GENERIC_FAVICON_BYTES
     if _GENERIC_FAVICON_BYTES is None:
         try:
@@ -155,10 +181,10 @@ def _is_real_favicon(content):
     if content == _GENERIC_FAVICON_BYTES:
         return False
     try:
-        width, _ = Image.open(io.BytesIO(content)).size
+        Image.open(io.BytesIO(content))
     except Exception:
         return False
-    return width >= MIN_REAL_LOGO_SIZE
+    return True
 
 
 def guess_domain_candidates(name):
@@ -210,7 +236,11 @@ def find_logo_domain(company_name, companies_by_name):
 
 def logo_url_for(company_name, companies_by_name):
     domain = find_logo_domain(company_name, companies_by_name)
-    return favicon_url(domain) if domain else None
+    if not domain:
+        return None
+    if _has_logo_dev_logo(domain):
+        return logo_dev_url(domain)
+    return favicon_url(domain)
 
 
 def is_us_location(name):
