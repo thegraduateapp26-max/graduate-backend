@@ -255,3 +255,19 @@ def send_daily_analytics_email(to_email: str, stats: dict):
         "subject": f"Graduate Daily Report | {today}",
         "html": _wrap(inner),
     })
+
+
+def send_contact_notification(admin_email: str, name: str, sender_email: str, message: str):
+    # Escaped like everything else here - this is fully public, unauthenticated user input.
+    inner = f"""
+      <h1 style="font-size:22px; color:#0f172a; margin:0 0 12px;">New contact form message</h1>
+      <p style="color:#475569; font-size:14px; line-height:1.6; margin:0 0 4px;"><strong>From:</strong> {_esc(name)} ({_esc(sender_email)})</p>
+      <div style="margin-top:16px; padding:16px; background:#f8fafc; border-radius:12px; color:#334155; font-size:14px; line-height:1.6; white-space:pre-wrap;">{_esc(message)}</div>
+    """
+    return resend.Emails.send({
+        "from": FROM_EMAIL,
+        "to": admin_email,
+        "reply_to": sender_email,
+        "subject": f"Graduate contact form: {name}",
+        "html": _wrap(inner),
+    })

@@ -85,6 +85,7 @@ def handle_preflight():
 JWT_SECRET = os.environ["JWT_SECRET"]  # no insecure fallback - fail loudly if unset rather than sign tokens with a guessable default
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")  # unset until a Google Cloud OAuth Client ID is created; endpoint 503s until then
 DATABASE_URL = os.environ.get("DATABASE_URL")
+ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "gabbybranch84@gmail.com")  # same var analytics_report.py already uses - where contact form messages get emailed
 
 
 # -----------------------------
@@ -233,6 +234,15 @@ def init_db():
             duration_seconds INTEGER,
             views INTEGER DEFAULT 0,
             is_active BOOLEAN DEFAULT TRUE,
+            created_at TIMESTAMP DEFAULT NOW()
+        );
+
+        CREATE TABLE IF NOT EXISTS contact_messages (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            name TEXT NOT NULL,
+            email TEXT NOT NULL,
+            message TEXT NOT NULL,
+            user_id UUID REFERENCES users(id),
             created_at TIMESTAMP DEFAULT NOW()
         );
     """)
@@ -2690,6 +2700,54 @@ def view_spotlight(spotlight_id):
 
     except Exception as e:
         conn.rollback()
+        sentry_sdk.capture_exception(e)
+        print(f"Error: {e}")
+        return jsonify({"error": "An unexpected error occurred."}), 500
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+# -----------------------------
+# CONTACT FORM
+# -----------------------------
+@app.post("/api/contact")
+@limiter.limit("5 per hour")
+def submit_contact_message():
+    data = request.json or {}
+    name = (data.get("name") or "").strip()
+    email = (data.get("email") or "").strip()
+    message = (data.get("message") or "").strip()
+
+    if not name or not email or not message:
+        return jsonify({"error": "name, email, and message are required"}), 400
+    if len(name) > 200 or len(email) > 200:
+        return jsonify({"error": "name/email is too long"}), 400
+    if len(message) > 5000:
+        return jsonify({"error": "message is too long (5000 characters max)"}), 400
+
+    user_id = get_current_user()  # optional - the form works whether or not you're signed in
+
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "INSERT INTO contact_messages (name, email, message, user_id) VALUES (%s, %s, %s, %s) RETURNING id",
+            (name, email, message, user_id),
+        )
+        result = cur.fetchone()
+        conn.commit()
+
+        try:
+            emails.send_contact_notification(ADMIN_EMAIL, name, email, message)
+        except Exception as e:
+            sentry_sdk.capture_exception(e)
+            print(f"Contact notification email error: {e}")
+
+        return jsonify({"status": "sent", "id": str(result['id'])})
+
+    except Exception as e:
         sentry_sdk.capture_exception(e)
         print(f"Error: {e}")
         return jsonify({"error": "An unexpected error occurred."}), 500
