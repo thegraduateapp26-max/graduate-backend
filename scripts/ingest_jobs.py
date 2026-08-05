@@ -42,11 +42,17 @@ TARGET_COUNT = 500
 # Well-known brands confirmed (by hand, via the API) to actually have current internship/entry
 # -level listings on The Muse - queried by name in addition to the category sampling below,
 # since a handful of big employers don't reliably surface through category/level alone.
-# Some requested brands (BNY Mellon, Duolingo) have zero current listings on this source as of
-# writing and are deliberately left out rather than faked.
+# Tested ~90 recognizable brands total (finance, tech, healthcare, retail, aerospace, and
+# Pittsburgh-area employers specifically, since that's where the site is based) - most large
+# consumer/tech brands (Adobe, Amazon, Apple, Google, Netflix, Nike, Duolingo, BNY Mellon, most
+# Pittsburgh employers incl. UPMC, Highmark, Westinghouse, FedEx Ground) have zero current
+# listings on this source and are deliberately left out rather than faked.
 PRIORITY_COMPANIES = [
     "PNC", "Salesforce", "Mastercard", "IBM", "Wells Fargo", "Bank of America",
     "Visa", "Charles Schwab", "Capital One", "Fidelity Investments",
+    "Ansys",  # Pittsburgh-area (Canonsburg, PA)
+    "Deloitte", "PwC", "Johnson & Johnson", "PepsiCo", "Chevron", "General Motors",
+    "Northrop Grumman", "Meta", "Uber", "USAA", "Morgan Stanley",
 ]
 
 COMPANIES_JSON = os.path.join(
@@ -132,7 +138,7 @@ def favicon_url(domain, size=128):
 _GENERIC_FAVICON_BYTES = None
 
 
-MIN_REAL_LOGO_SIZE = 48  # matches LogoImg's client-side floor - below this it looks pixelated once scaled up to card/modal size
+MIN_REAL_LOGO_SIZE = 64  # matches LogoImg's client-side floor - see its comment for why 64 (retina/2x displays, and Google's favicon service caps out well below what a 128px modal box would need at full crispness regardless)
 
 
 def _is_real_favicon(content):
