@@ -14,6 +14,7 @@ import os
 import random
 import re
 import time
+from datetime import datetime, timedelta, timezone
 
 import psycopg2
 import psycopg2.extras
@@ -23,6 +24,12 @@ from PIL import Image
 
 API_URL = "https://www.themuse.com/api/public/jobs"
 LEVELS = ["Internship", "Entry Level"]
+# The Muse's feed has no recency filter of its own - a live run of prune_dead_jobs.py found
+# 173/423 (41%) already-dead listings, several literally "Summer 2025" postings well over a
+# year stale. Reject anything older than this at ingestion time instead of accumulating more
+# of the same; prune_dead_jobs.py still needs to run periodically for postings that go dead
+# *after* being ingested (filled/pulled within their normal lifespan).
+MAX_POSTING_AGE_DAYS = 120
 # The Muse's actual category taxonomy (confirmed by sampling live results - its docs list
 # a different/stale set). Querying category-by-category, instead of only paging through the
 # unfiltered level feed, is what gets breadth across industries instead of an unfiltered feed
@@ -512,6 +519,17 @@ def is_organized(row):
     return has_structure and has_real_description
 
 
+def is_recent(raw, max_age_days=MAX_POSTING_AGE_DAYS):
+    pub_date = raw.get("publication_date")
+    if not pub_date:
+        return True  # no date on file - don't reject on missing data, only on confirmed staleness
+    try:
+        published = datetime.fromisoformat(pub_date.replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    return datetime.now(timezone.utc) - published <= timedelta(days=max_age_days)
+
+
 def _consider(raw, level, companies_by_name, seen_ids, company_counts, rows, max_per_company):
     if len(rows) >= TARGET_COUNT:
         return False
@@ -519,6 +537,8 @@ def _consider(raw, level, companies_by_name, seen_ids, company_counts, rows, max
         return True
     company_name = raw.get("company", {}).get("name", "").strip()
     if not raw.get("name") or not company_name:
+        return True
+    if not is_recent(raw):
         return True
     if company_counts.get(company_name, 0) >= max_per_company:
         return True
