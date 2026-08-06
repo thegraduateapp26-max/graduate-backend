@@ -419,6 +419,52 @@ def fetch_query(params, pages, label):
         time.sleep(0.15)
 
 
+def extract_apply_link(html):
+    """The Muse's public API only ever exposes its own hosted page as a job's URL (refs.landing_
+    page) - confirmed by sampling many jobs across different employers, never a direct link to
+    the real posting. But that hosted page's own Next.js payload embeds an `applyLink` field
+    pointing at the real employer application (Workday/Greenhouse/iCIMS/the company's own
+    careers site/etc) - it's just not in the public API response, so it takes a follow-up fetch
+    of the page itself to get at it. The field is JS-escaped (`\\"applyLink\\":\\"...`) since
+    it's nested inside the page's server-rendered JSON-in-a-script-tag payload."""
+    marker = '\\"applyLink\\":\\"'
+    idx = html.find(marker)
+    if idx == -1:
+        return None
+    start = idx + len(marker)
+    end = html.find('\\"', start)
+    if end == -1:
+        return None
+    raw = html[start:end].replace('\\u0026', '&').replace('\\/', '/')
+    if not raw:
+        return None
+    # Some applyLinks are themselves ad-tracking redirects (e.g. doubleclick.net) that embed
+    # the real destination as a nested URL rather than linking to it directly - prefer the
+    # innermost one so the stored link goes straight to the employer, not through an ad hop.
+    nested = list(re.finditer(r"https?://", raw))
+    if len(nested) > 1:
+        inner = raw[nested[-1].start():]
+        m = re.match(r"^(https?://[^&]*(?:\?[^&]*)?)", inner)
+        raw = m.group(1) if m else inner
+    return raw
+
+
+def resolve_real_apply_url(landing_page):
+    """Falls back to the Muse page itself if the follow-up fetch fails or the field isn't
+    found on it, rather than leaving url empty - a Muse link is still better than no link."""
+    if not landing_page:
+        return None
+    try:
+        resp = requests.get(landing_page, timeout=10)
+        if resp.ok:
+            link = extract_apply_link(resp.text)
+            if link:
+                return link
+    except requests.exceptions.RequestException:
+        pass
+    return landing_page
+
+
 def build_job_row(raw, level_name, companies_by_name):
     title = raw.get("name", "").strip()
     company = raw.get("company", {}).get("name", "").strip()
@@ -452,7 +498,7 @@ def build_job_row(raw, level_name, companies_by_name):
         "job_type": job_type,
         "employment_type": employment_type,
         "description": parsed["description"],
-        "url": raw.get("refs", {}).get("landing_page"),
+        "url": resolve_real_apply_url(raw.get("refs", {}).get("landing_page")),
         "tags": [],
         "job_function": job_function,
         "industry": industry,
