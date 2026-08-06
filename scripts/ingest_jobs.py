@@ -15,6 +15,7 @@ import random
 import re
 import time
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse
 
 import psycopg2
 import psycopg2.extras
@@ -565,6 +566,22 @@ def is_organized(row):
     return has_structure and has_real_description
 
 
+# Domains a resolved apply link must never land on. click.appcast.io was found (2026-08-06)
+# to redirect every Walmart posting to a generic third-party "Get Great Careers" job-search
+# homepage - not Walmart, not the specific role, not even a job board that knows about this
+# posting. adzuna.com's ad-landing links 404 outright. themuse.com covers the case where
+# resolve_real_apply_url() couldn't extract a real applyLink and fell back to the Muse page
+# itself - the user explicitly doesn't want that as a stored link, so a job we can't resolve
+# to a real specific posting shouldn't be shown at all rather than silently degrading.
+BLOCKED_APPLY_DOMAINS = {"click.appcast.io", "www.adzuna.com", "adzuna.com", "www.themuse.com", "themuse.com"}
+
+
+def is_bad_apply_url(url):
+    if not url:
+        return True
+    return urlparse(url).netloc.lower() in BLOCKED_APPLY_DOMAINS
+
+
 def is_recent(raw, max_age_days=MAX_POSTING_AGE_DAYS):
     pub_date = raw.get("publication_date")
     if not pub_date:
@@ -594,6 +611,8 @@ def _consider(raw, level, companies_by_name, seen_ids, company_counts, rows, max
         return True
     row = build_job_row(raw, level, companies_by_name)
     if not is_organized(row):
+        return True
+    if is_bad_apply_url(row["url"]):
         return True
     seen_ids.add(raw["id"])
     company_counts[company_name] = company_counts.get(company_name, 0) + 1
