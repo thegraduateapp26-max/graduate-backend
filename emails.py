@@ -271,3 +271,24 @@ def send_contact_notification(admin_email: str, name: str, sender_email: str, me
         "subject": f"Graduate contact form: {name}",
         "html": _wrap(inner),
     })
+
+
+def send_report_notification(admin_email: str, reporter_name: str, reporter_email: str, author_name: str, reason_label: str, details: str, post_content: str):
+    # post_content/details are reported (i.e. flagged as objectionable) user input - escaped
+    # the same as contact form input, and truncated so one huge post can't blow up the email.
+    details_html = f"""<p style="color:#475569; font-size:14px; line-height:1.6; margin:16px 0 4px;"><strong>Reporter's notes:</strong></p><div style="padding:16px; background:#f8fafc; border-radius:12px; color:#334155; font-size:14px; line-height:1.6; white-space:pre-wrap;">{_esc(details)}</div>""" if details else ""
+    inner = f"""
+      <h1 style="font-size:22px; color:#0f172a; margin:0 0 12px;">Post reported: {_esc(reason_label)}</h1>
+      <p style="color:#475569; font-size:14px; line-height:1.6; margin:0 0 4px;"><strong>Reported by:</strong> {_esc(reporter_name)} ({_esc(reporter_email)})</p>
+      <p style="color:#475569; font-size:14px; line-height:1.6; margin:0 0 4px;"><strong>Post author:</strong> {_esc(author_name)}</p>
+      {details_html}
+      <p style="color:#475569; font-size:14px; line-height:1.6; margin:16px 0 4px;"><strong>Reported post:</strong></p>
+      <div style="padding:16px; background:#f8fafc; border-radius:12px; color:#334155; font-size:14px; line-height:1.6; white-space:pre-wrap;">{_esc(post_content[:2000])}</div>
+    """
+    return resend.Emails.send({
+        "from": FROM_EMAIL,
+        "to": admin_email,
+        "reply_to": reporter_email,
+        "subject": f"Graduate report: {reason_label} (from {reporter_name})",
+        "html": _wrap(inner),
+    })

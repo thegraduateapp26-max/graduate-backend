@@ -245,6 +245,16 @@ def init_db():
             user_id UUID REFERENCES users(id),
             created_at TIMESTAMP DEFAULT NOW()
         );
+
+        CREATE TABLE IF NOT EXISTS reports (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            reporter_id UUID NOT NULL REFERENCES users(id),
+            post_id UUID NOT NULL REFERENCES posts(id),
+            reason TEXT NOT NULL,
+            details TEXT,
+            created_at TIMESTAMP DEFAULT NOW(),
+            UNIQUE (reporter_id, post_id)
+        );
     """)
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_matches_sent BOOLEAN DEFAULT FALSE;")
     cur.execute("ALTER TABLE post_comments ADD COLUMN IF NOT EXISTS parent_comment_id UUID REFERENCES post_comments(id);")
@@ -2154,6 +2164,86 @@ def create_post_comment(post_id):
                 "parentCommentId": str(result['parent_comment_id']) if result['parent_comment_id'] else None,
             }
         })
+
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        print(f"Error: {e}")
+        return jsonify({"error": "An unexpected error occurred."}), 500
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+# -----------------------------
+# CONTENT REPORTS
+# -----------------------------
+REPORT_REASONS = {
+    "spam": "Spam or misleading",
+    "scam": "Scam or fraud",
+    "harassment": "Harassment or bullying",
+    "hate": "Hate speech or discrimination",
+    "violence": "Violence or threats",
+    "explicit": "Nudity or sexual content",
+    "misinformation": "False information",
+    "self_harm": "Self-harm or suicide content",
+    "other": "Something else",
+}
+
+
+@app.post("/api/feed/<post_id>/report")
+@limiter.limit("20 per hour")
+def report_feed_post(post_id):
+    reporter_id = get_current_user()
+    if not reporter_id:
+        return jsonify({"error": "authentication required"}), 401
+
+    data = request.json or {}
+    reason = (data.get("reason") or "").strip()
+    details = (data.get("details") or "").strip()
+
+    if reason not in REPORT_REASONS:
+        return jsonify({"error": "invalid reason"}), 400
+    if len(details) > 2000:
+        return jsonify({"error": "details is too long (2000 characters max)"}), 400
+
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT author_id, content FROM posts WHERE id = %s", (post_id,))
+        post = cur.fetchone()
+        if not post:
+            return jsonify({"error": "post not found"}), 404
+        if str(post['author_id']) == reporter_id:
+            return jsonify({"error": "you can't report your own post"}), 400
+
+        cur.execute(
+            "INSERT INTO reports (reporter_id, post_id, reason, details) VALUES (%s, %s, %s, %s) RETURNING id",
+            (reporter_id, post_id, reason, details or None),
+        )
+        result = cur.fetchone()
+        conn.commit()
+
+        try:
+            cur.execute("SELECT name, email FROM users WHERE id = %s", (reporter_id,))
+            reporter = cur.fetchone()
+            cur.execute("SELECT name FROM users WHERE id = %s", (post['author_id'],))
+            author = cur.fetchone()
+            emails.send_report_notification(
+                ADMIN_EMAIL,
+                reporter['name'], reporter['email'],
+                author['name'] if author else 'Unknown user',
+                REPORT_REASONS[reason], details,
+                post['content'],
+            )
+        except Exception as e:
+            sentry_sdk.capture_exception(e)
+            print(f"Report notification email error: {e}")
+
+        return jsonify({"status": "reported", "id": str(result['id'])})
+
+    except psycopg2.errors.UniqueViolation:
+        return jsonify({"error": "you've already reported this post"}), 409
 
     except Exception as e:
         sentry_sdk.capture_exception(e)
