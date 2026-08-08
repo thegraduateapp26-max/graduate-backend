@@ -1038,6 +1038,8 @@ def delete_account(user_id):
         cur.execute("DELETE FROM post_comments WHERE author_id = %s", (user_id,))
         cur.execute("DELETE FROM post_likes WHERE post_id IN (SELECT id FROM posts WHERE author_id = %s)", (user_id,))
         cur.execute("DELETE FROM post_likes WHERE user_id = %s", (user_id,))
+        cur.execute("DELETE FROM reports WHERE post_id IN (SELECT id FROM posts WHERE author_id = %s)", (user_id,))
+        cur.execute("DELETE FROM reports WHERE reporter_id = %s", (user_id,))
         cur.execute("DELETE FROM posts WHERE author_id = %s", (user_id,))
         cur.execute("DELETE FROM endorsements WHERE recipient_id = %s OR author_id = %s", (user_id, user_id))
         cur.execute("DELETE FROM messages WHERE sender_id = %s OR recipient_id = %s", (user_id, user_id))
@@ -2038,6 +2040,7 @@ def delete_feed_post(post_id):
         # No ON DELETE CASCADE on these foreign keys, so clear child rows first.
         cur.execute("DELETE FROM post_comments WHERE post_id = %s", (post_id,))
         cur.execute("DELETE FROM post_likes WHERE post_id = %s", (post_id,))
+        cur.execute("DELETE FROM reports WHERE post_id = %s", (post_id,))
         cur.execute("DELETE FROM posts WHERE id = %s", (post_id,))
         conn.commit()
 
