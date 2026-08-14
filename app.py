@@ -5,6 +5,7 @@ import bcrypt
 import jwt
 import pyotp
 import psycopg2
+import stripe
 import sentry_sdk
 from sentry_sdk.integrations.flask import FlaskIntegration
 from psycopg2.extras import RealDictCursor, Json
@@ -86,6 +87,12 @@ JWT_SECRET = os.environ["JWT_SECRET"]  # no insecure fallback - fail loudly if u
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")  # unset until a Google Cloud OAuth Client ID is created; endpoint 503s until then
 DATABASE_URL = os.environ.get("DATABASE_URL")
 ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "gabbybranch84@gmail.com")  # same var analytics_report.py already uses - where contact form messages get emailed
+
+# Unset until the user's Stripe account/keys are wired up - checkout/portal endpoints 503
+# until then rather than failing confusingly deep inside the stripe library.
+stripe.api_key = os.environ.get("STRIPE_SECRET_KEY")
+STRIPE_PRICE_ID = os.environ.get("STRIPE_PRICE_ID")
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")
 
 
 # -----------------------------
@@ -299,6 +306,8 @@ def init_db():
     # will become the source of truth driven by Stripe subscription webhooks once billing is wired up,
     # but the column/gating logic underneath doesn't need to change when that happens.
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_premium BOOLEAN DEFAULT FALSE;")
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT;")
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_subscription_id TEXT;")
     cur.execute("ALTER TABLE applications ADD COLUMN IF NOT EXISTS confirmed BOOLEAN DEFAULT FALSE;")
     cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS jobs_source_source_id_idx ON jobs (source, source_id) WHERE source IS NOT NULL;")
     # One-time badge assignments (only applied if not already set, so a later admin
@@ -1450,6 +1459,152 @@ def update_user_premium(user_id):
     except Exception as e:
         sentry_sdk.capture_exception(e)
         print(f"Error: {e}")
+        return jsonify({"error": "An unexpected error occurred."}), 500
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+# -----------------------------
+# PREMIUM BILLING (STRIPE)
+# -----------------------------
+@app.post("/api/premium/checkout")
+def create_premium_checkout():
+    user_id = get_current_user()
+    if not user_id:
+        return jsonify({"error": "authentication required"}), 401
+    if not stripe.api_key or not STRIPE_PRICE_ID:
+        return jsonify({"error": "Billing isn't set up yet."}), 503
+
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT email, name, stripe_customer_id, is_premium FROM users WHERE id = %s", (user_id,))
+        user = cur.fetchone()
+        if not user:
+            return jsonify({"error": "user not found"}), 404
+        if user['is_premium']:
+            return jsonify({"error": "You're already Premium."}), 400
+
+        # Reuse the existing Stripe Customer if this user has checked out before (even if
+        # they've since cancelled) rather than creating a duplicate one every time.
+        customer_id = user['stripe_customer_id']
+        if not customer_id:
+            customer = stripe.Customer.create(email=user['email'], name=user['name'], metadata={"user_id": user_id})
+            customer_id = customer.id
+            cur.execute("UPDATE users SET stripe_customer_id = %s WHERE id = %s", (customer_id, user_id))
+            conn.commit()
+
+        session = stripe.checkout.Session.create(
+            customer=customer_id,
+            mode="subscription",
+            line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
+            success_url=f"{emails.APP_URL}?premium=success",
+            cancel_url=f"{emails.APP_URL}?premium=cancelled",
+            client_reference_id=user_id,
+        )
+        return jsonify({"url": session.url})
+
+    except stripe.error.StripeError as e:
+        sentry_sdk.capture_exception(e)
+        return jsonify({"error": "Could not start checkout. Please try again."}), 502
+
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        print(f"Error: {e}")
+        return jsonify({"error": "An unexpected error occurred."}), 500
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.post("/api/premium/portal")
+def create_premium_portal():
+    user_id = get_current_user()
+    if not user_id:
+        return jsonify({"error": "authentication required"}), 401
+    if not stripe.api_key:
+        return jsonify({"error": "Billing isn't set up yet."}), 503
+
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT stripe_customer_id FROM users WHERE id = %s", (user_id,))
+        user = cur.fetchone()
+        if not user or not user['stripe_customer_id']:
+            return jsonify({"error": "No billing account on file yet."}), 400
+
+        session = stripe.billing_portal.Session.create(
+            customer=user['stripe_customer_id'],
+            return_url=emails.APP_URL,
+        )
+        return jsonify({"url": session.url})
+
+    except stripe.error.StripeError as e:
+        sentry_sdk.capture_exception(e)
+        return jsonify({"error": "Could not open the billing portal. Please try again."}), 502
+
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        print(f"Error: {e}")
+        return jsonify({"error": "An unexpected error occurred."}), 500
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+# Stripe calls this directly (no JWT of ours to check) - authenticity comes from verifying
+# the request signature against STRIPE_WEBHOOK_SECRET instead. is_premium becomes fully
+# webhook-driven from here on; the admin PATCH endpoint above still works as a manual
+# override (comping someone, undoing a mistake) but normal upgrades/cancellations flow
+# through this instead.
+@app.post("/api/stripe/webhook")
+def stripe_webhook():
+    payload = request.data
+    sig_header = request.headers.get("Stripe-Signature")
+    try:
+        event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
+    except (ValueError, stripe.error.SignatureVerificationError) as e:
+        sentry_sdk.capture_exception(e)
+        return jsonify({"error": "invalid signature"}), 400
+
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        event_type = event["type"]
+        data = event["data"]["object"]
+
+        if event_type == "checkout.session.completed":
+            customer_id = data.get("customer")
+            subscription_id = data.get("subscription")
+            user_id = data.get("client_reference_id")
+            if user_id:
+                cur.execute(
+                    "UPDATE users SET is_premium = TRUE, stripe_customer_id = %s, stripe_subscription_id = %s WHERE id = %s",
+                    (customer_id, subscription_id, user_id),
+                )
+            elif customer_id:
+                cur.execute(
+                    "UPDATE users SET is_premium = TRUE, stripe_subscription_id = %s WHERE stripe_customer_id = %s",
+                    (subscription_id, customer_id),
+                )
+
+        elif event_type == "customer.subscription.updated":
+            active = data.get("status") in ("active", "trialing")
+            cur.execute("UPDATE users SET is_premium = %s WHERE stripe_customer_id = %s", (active, data.get("customer")))
+
+        elif event_type == "customer.subscription.deleted":
+            cur.execute("UPDATE users SET is_premium = FALSE WHERE stripe_customer_id = %s", (data.get("customer"),))
+
+        conn.commit()
+        return jsonify({"status": "ok"})
+
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        print(f"Stripe webhook error: {e}")
         return jsonify({"error": "An unexpected error occurred."}), 500
 
     finally:
