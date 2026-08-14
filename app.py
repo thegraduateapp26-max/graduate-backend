@@ -1086,6 +1086,7 @@ def delete_account(user_id):
         cur.execute("DELETE FROM connections WHERE requester_id = %s OR recipient_id = %s", (user_id, user_id))
         cur.execute("DELETE FROM applications WHERE user_id = %s", (user_id,))
         cur.execute("DELETE FROM verification_requests WHERE user_id = %s", (user_id,))
+        cur.execute("DELETE FROM profile_views WHERE viewer_id = %s OR viewed_user_id = %s", (user_id, user_id))
         cur.execute("DELETE FROM users WHERE id = %s", (user_id,))
         conn.commit()
 
