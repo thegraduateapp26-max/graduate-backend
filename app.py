@@ -255,6 +255,13 @@ def init_db():
             created_at TIMESTAMP DEFAULT NOW(),
             UNIQUE (reporter_id, post_id)
         );
+
+        CREATE TABLE IF NOT EXISTS profile_views (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            viewer_id UUID NOT NULL REFERENCES users(id),
+            viewed_user_id UUID NOT NULL REFERENCES users(id),
+            created_at TIMESTAMP DEFAULT NOW()
+        );
     """)
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_matches_sent BOOLEAN DEFAULT FALSE;")
     cur.execute("ALTER TABLE post_comments ADD COLUMN IF NOT EXISTS parent_comment_id UUID REFERENCES post_comments(id);")
@@ -288,6 +295,11 @@ def init_db():
     cur.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS logo_url TEXT;")
     cur.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS source TEXT;")
     cur.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS source_id TEXT;")
+    # is_premium is a manually-toggled flag for now (see PATCH /api/users/<id>/premium, admin-only) -
+    # will become the source of truth driven by Stripe subscription webhooks once billing is wired up,
+    # but the column/gating logic underneath doesn't need to change when that happens.
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_premium BOOLEAN DEFAULT FALSE;")
+    cur.execute("ALTER TABLE applications ADD COLUMN IF NOT EXISTS confirmed BOOLEAN DEFAULT FALSE;")
     cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS jobs_source_source_id_idx ON jobs (source, source_id) WHERE source IS NOT NULL;")
     # One-time badge assignments (only applied if not already set, so a later admin
     # edit via the UI isn't silently reverted by a future deploy).
@@ -397,6 +409,34 @@ def is_admin(user_id):
     cur.close()
     conn.close()
     return bool(row and row['role'] == 'admin')
+
+
+def is_premium(user_id):
+    if not user_id:
+        return False
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT is_premium FROM users WHERE id = %s", (user_id,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return bool(row and row['is_premium'])
+
+
+def are_connected(user_a, user_b):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT 1 FROM connections
+        WHERE status = 'accepted' AND (
+            (requester_id = %s AND recipient_id = %s) OR
+            (requester_id = %s AND recipient_id = %s)
+        )
+    """, (user_a, user_b, user_b, user_a))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return bool(row)
 
 
 # Logging back in is how a deactivated ("taking a break") account comes back - no separate
@@ -1218,7 +1258,7 @@ def list_users():
         SELECT u.id, u.name, u.role, u.verification_status, u.headline, u.school,
         u.major, u.location, u.avatar_url, u.background_url, u.bio, u.active_status,
         u.projects, u.custom_badge, u.skills, u.grad_year, u.expected_graduation_date, u.work_history, u.created_at,
-        u.endorsements_hidden,
+        u.endorsements_hidden, u.is_premium,
         EXISTS(SELECT 1 FROM spotlights s WHERE s.user_id = u.id AND s.is_active = TRUE) AS has_spotlight
         FROM users u
         WHERE u.deactivated_at IS NULL
@@ -1254,6 +1294,7 @@ def list_users():
             "createdAt": r['created_at'].isoformat() if r['created_at'] else None,
             "hasSpotlight": bool(r['has_spotlight']) if viewer_can_see_spotlights else False,
             "endorsementsHidden": bool(r['endorsements_hidden']),
+            "isPremium": bool(r['is_premium']),
         })
 
     return jsonify(users)
@@ -1377,6 +1418,45 @@ def update_user_verification(user_id):
 
 
 # -----------------------------
+# ADMIN: PREMIUM STATUS
+# -----------------------------
+# Manual toggle for now - the source of truth for is_premium until Stripe billing is wired up,
+# at which point subscription webhooks take over setting this same column instead of an admin.
+@app.patch("/api/users/<user_id>/premium")
+def update_user_premium(user_id):
+    current_user = get_current_user()
+    if not is_admin(current_user):
+        return jsonify({"error": "unauthorized"}), 401
+
+    data = request.json or {}
+    if "isPremium" not in data:
+        return jsonify({"error": "isPremium is required"}), 400
+    value = bool(data.get("isPremium"))
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("UPDATE users SET is_premium = %s WHERE id = %s RETURNING id", (value, user_id))
+        updated = cur.fetchone()
+        conn.commit()
+
+        if not updated:
+            return jsonify({"error": "user not found"}), 404
+
+        return jsonify({"status": "updated", "id": str(updated['id']), "isPremium": value})
+
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        print(f"Error: {e}")
+        return jsonify({"error": "An unexpected error occurred."}), 500
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+# -----------------------------
 # ADMIN: CUSTOM BADGE
 # -----------------------------
 @app.patch("/api/users/<user_id>/badge")
@@ -1449,6 +1529,97 @@ def get_connection_status(user_id):
             return jsonify({"status": "pending_sent", "connectionId": str(row['id'])})
         return jsonify({"status": "pending_received", "connectionId": str(row['id'])})
     return jsonify({"status": "none"})
+
+
+# -----------------------------
+# PROFILE VIEWS
+# -----------------------------
+@app.post("/api/users/<user_id>/view")
+@limiter.limit("60 per minute")
+def record_profile_view(user_id):
+    viewer_id = get_current_user()
+    if not viewer_id or viewer_id == user_id:
+        return jsonify({"status": "skipped"})
+
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        # Collapse repeat visits within the same day into one row instead of a new one on
+        # every page load/refresh - "23 people viewed your profile" should mean 23 distinct
+        # visits, not 23 reloads by the same person.
+        cur.execute("""
+            SELECT 1 FROM profile_views
+            WHERE viewer_id = %s AND viewed_user_id = %s AND created_at > NOW() - INTERVAL '24 hours'
+        """, (viewer_id, user_id))
+        if cur.fetchone():
+            return jsonify({"status": "skipped"})
+
+        cur.execute(
+            "INSERT INTO profile_views (viewer_id, viewed_user_id) VALUES (%s, %s)",
+            (viewer_id, user_id),
+        )
+        conn.commit()
+        return jsonify({"status": "recorded"})
+
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        print(f"Error: {e}")
+        return jsonify({"error": "An unexpected error occurred."}), 500
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.get("/api/users/<user_id>/profile-views")
+def list_profile_views(user_id):
+    current_user = get_current_user()
+    if not current_user or current_user != user_id:
+        return jsonify({"error": "unauthorized"}), 401
+
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        # Total/unique counts are shown to everyone (the upsell hook - "12 people viewed your
+        # profile, upgrade to see who"), but the actual identities are premium-only.
+        cur.execute("SELECT COUNT(*) AS total, COUNT(DISTINCT viewer_id) AS unique_viewers FROM profile_views WHERE viewed_user_id = %s", (user_id,))
+        counts = cur.fetchone()
+
+        viewers = []
+        if is_premium(current_user):
+            cur.execute("""
+                SELECT u.id, u.name, u.headline, u.avatar_url, u.role, MAX(pv.created_at) AS last_viewed_at
+                FROM profile_views pv
+                JOIN users u ON u.id = pv.viewer_id
+                WHERE pv.viewed_user_id = %s
+                GROUP BY u.id, u.name, u.headline, u.avatar_url, u.role
+                ORDER BY last_viewed_at DESC
+                LIMIT 100
+            """, (user_id,))
+            for r in cur.fetchall():
+                viewers.append({
+                    "id": str(r['id']),
+                    "name": r['name'],
+                    "headline": r['headline'],
+                    "avatarUrl": r['avatar_url'],
+                    "role": r['role'],
+                    "lastViewedAt": r['last_viewed_at'].isoformat() if r['last_viewed_at'] else None,
+                })
+
+        return jsonify({
+            "totalViews": counts['total'],
+            "uniqueViewers": counts['unique_viewers'],
+            "viewers": viewers,
+        })
+
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        print(f"Error: {e}")
+        return jsonify({"error": "An unexpected error occurred."}), 500
+
+    finally:
+        cur.close()
+        conn.close()
 
 
 @app.post("/api/users/<user_id>/connect")
@@ -1714,6 +1885,21 @@ def send_message(other_user_id):
 
     conn = get_conn()
     cur = conn.cursor()
+
+    # Free accounts can only message existing connections - messaging anyone is a Premium perk.
+    # Already-connected pairs and premium senders skip the check entirely, and replying to an
+    # existing thread is always allowed (whoever started it already had permission to) so a
+    # premium user messaging a free one doesn't leave the free user unable to reply.
+    if not is_premium(current_user) and not are_connected(current_user, other_user_id):
+        cur.execute("""
+            SELECT 1 FROM messages
+            WHERE (sender_id = %s AND recipient_id = %s) OR (sender_id = %s AND recipient_id = %s)
+            LIMIT 1
+        """, (current_user, other_user_id, other_user_id, current_user))
+        if not cur.fetchone():
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Messaging anyone outside your network is a Premium feature. Connect with them first, or upgrade to Premium."}), 403
 
     try:
         cur.execute("""
@@ -2263,19 +2449,40 @@ def report_feed_post(post_id):
 # -----------------------------
 @app.get("/api/jobs")
 def list_jobs():
+    requester_id = get_current_user()
+    requester_is_premium = is_premium(requester_id)
+
     conn = get_conn()
     cur = conn.cursor()
 
-    cur.execute("""
-        SELECT id, title, company, location, salary_range,
-        job_type, description, url, tags, created_at, is_active,
-        job_function, industry, seniority_level, job_summary, employment_type,
-        key_responsibilities, qualifications, preferred_qualifications, about_company, logo_url
-        FROM jobs
-        WHERE is_active = TRUE
-        ORDER BY created_at DESC
-        LIMIT 600
-    """)
+    # Confirmed-applicant counts are only useful (and only shown) to Premium users - see the
+    # applications.confirmed column and PATCH /api/applications/<job_id>/confirm. Free requesters
+    # never even get the field in the response, not just a hidden-in-the-UI one.
+    if requester_is_premium:
+        cur.execute("""
+            SELECT j.id, j.title, j.company, j.location, j.salary_range,
+            j.job_type, j.description, j.url, j.tags, j.created_at, j.is_active,
+            j.job_function, j.industry, j.seniority_level, j.job_summary, j.employment_type,
+            j.key_responsibilities, j.qualifications, j.preferred_qualifications, j.about_company, j.logo_url,
+            COUNT(a.id) FILTER (WHERE a.confirmed) AS confirmed_applicant_count
+            FROM jobs j
+            LEFT JOIN applications a ON a.job_id = j.id
+            WHERE j.is_active = TRUE
+            GROUP BY j.id
+            ORDER BY j.created_at DESC
+            LIMIT 600
+        """)
+    else:
+        cur.execute("""
+            SELECT id, title, company, location, salary_range,
+            job_type, description, url, tags, created_at, is_active,
+            job_function, industry, seniority_level, job_summary, employment_type,
+            key_responsibilities, qualifications, preferred_qualifications, about_company, logo_url
+            FROM jobs
+            WHERE is_active = TRUE
+            ORDER BY created_at DESC
+            LIMIT 600
+        """)
 
     rows = cur.fetchall()
     cur.close()
@@ -2283,7 +2490,7 @@ def list_jobs():
 
     jobs = []
     for r in rows:
-        jobs.append({
+        job = {
             "id": str(r['id']),
             "title": r['title'],
             "company": r['company'],
@@ -2305,7 +2512,10 @@ def list_jobs():
             "preferredQualifications": r['preferred_qualifications'] or [],
             "aboutCompany": r['about_company'],
             "logoUrl": r['logo_url'],
-        })
+        }
+        if requester_is_premium:
+            job["confirmedApplicantCount"] = r['confirmed_applicant_count']
+        jobs.append(job)
 
     return jsonify(jobs)
 
@@ -2433,6 +2643,40 @@ def apply_to_job():
 
     except psycopg2.errors.UniqueViolation:
         return jsonify({"error": "already applied"}), 400
+
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        print(f"Error: {e}")
+        return jsonify({"error": "An unexpected error occurred."}), 500
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+# Clicking Apply Now only tells us someone opened the employer's application page in a new
+# tab, not that they actually finished applying there - this is the frontend's "did you
+# apply?" follow-up prompt (shown when the user returns to the Graduate tab) confirming it,
+# which is what confirmedApplicantCount on /api/jobs is actually counting.
+@app.patch("/api/applications/<application_id>/confirm")
+def confirm_application(application_id):
+    user_id = get_current_user()
+    if not user_id:
+        return jsonify({"error": "authentication required"}), 401
+
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT user_id FROM applications WHERE id = %s", (application_id,))
+        application = cur.fetchone()
+        if not application:
+            return jsonify({"error": "application not found"}), 404
+        if str(application['user_id']) != user_id:
+            return jsonify({"error": "unauthorized"}), 401
+
+        cur.execute("UPDATE applications SET confirmed = TRUE WHERE id = %s", (application_id,))
+        conn.commit()
+        return jsonify({"status": "confirmed"})
 
     except Exception as e:
         sentry_sdk.capture_exception(e)
@@ -2611,10 +2855,12 @@ def create_spotlight():
     cur = conn.cursor()
 
     try:
-        cur.execute("SELECT role FROM users WHERE id = %s", (user_id,))
+        cur.execute("SELECT role, is_premium FROM users WHERE id = %s", (user_id,))
         uploader = cur.fetchone()
         if not uploader or uploader['role'] not in SPOTLIGHT_UPLOADER_ROLES:
             return jsonify({"error": "Only student, graduate, and high school graduate accounts can upload a Spotlight."}), 403
+        if not uploader['is_premium']:
+            return jsonify({"error": "Uploading a Spotlight is a Premium feature."}), 403
 
         data = request.json or {}
         video_url = data.get("videoUrl")
