@@ -284,6 +284,37 @@ def send_prune_report(admin_email: str, checked: int, removed: list):
     })
 
 
+def send_ingest_report(admin_email: str, new_count: int, new_jobs: list, full_refresh: bool = False):
+    today = datetime.date.today().strftime("%B %d, %Y")
+    mode_label = "Full Board Refresh" if full_refresh else "Weekly New Jobs"
+    if new_jobs:
+        # Capped so a full-refresh run (hundreds of rows) doesn't blow up the email body.
+        shown = new_jobs[:40]
+        rows = "".join(f"""
+          <tr>
+            <td style="padding:8px 0; color:#0f172a; font-size:13px; font-weight:700; border-bottom:1px solid #f1f5f9;">{_esc(r['title'])}</td>
+            <td style="padding:8px 0; color:#64748b; font-size:13px; text-align:right; border-bottom:1px solid #f1f5f9;">{_esc(r['company'])}</td>
+          </tr>
+        """ for r in shown)
+        more_note = f"""<p style="color:#94a3b8; font-size:12px; margin-top:12px;">...and {len(new_jobs) - len(shown)} more.</p>""" if len(new_jobs) > len(shown) else ""
+        body = f"""<table style="width:100%; border-collapse:collapse; margin-top:12px;">{rows}</table>{more_note}"""
+    else:
+        body = """<p style="color:#64748b; font-size:14px; margin-top:12px;">No new organized listings found this run - try again next week.</p>"""
+
+    inner = f"""
+      <h1 style="font-size:22px; color:#0f172a; margin:0 0 4px;">{mode_label}</h1>
+      <p style="color:#94a3b8; font-size:13px; margin:0 0 4px;">{today}</p>
+      <p style="color:#475569; font-size:14px; margin:12px 0 0;">Added {new_count} new job listing{'s' if new_count != 1 else ''} to the board.</p>
+      {body}
+    """
+    return resend.Emails.send({
+        "from": FROM_EMAIL,
+        "to": admin_email,
+        "subject": f"Graduate: {new_count} new job listing{'s' if new_count != 1 else ''} added | {today}",
+        "html": _wrap(inner),
+    })
+
+
 def send_contact_notification(admin_email: str, name: str, sender_email: str, message: str):
     # Escaped like everything else here - this is fully public, unauthenticated user input.
     inner = f"""

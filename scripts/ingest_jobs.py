@@ -7,12 +7,18 @@ referencing the company name against public/data/companies.json for a real logo.
 
 Usage:
     DATABASE_URL=postgresql://... python3 scripts/ingest_jobs.py
+    DATABASE_URL=postgresql://... python3 scripts/ingest_jobs.py --full-refresh
+
+Default mode is incremental: only adds jobs not already on the board (up to
+INCREMENTAL_TARGET_COUNT), never deletes anything. --full-refresh restores the
+old wipe-and-replace behavior for a deliberate manual re-seed of the whole board.
 """
 import io
 import json
 import os
 import random
 import re
+import sys
 import time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
@@ -22,6 +28,11 @@ import psycopg2.extras
 import requests
 from bs4 import BeautifulSoup, NavigableString
 from PIL import Image
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import emails
+
+ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "gabbybranch84@gmail.com")
 
 API_URL = "https://www.themuse.com/api/public/jobs"
 LEVELS = ["Internship", "Entry Level"]
@@ -46,6 +57,7 @@ PAGES_PER_QUERY = 40  # ~20 results/page; the organized-listing filter rejects a
 MAX_PER_COMPANY = 12  # prevents one high-volume poster (e.g. Walmart, CVS) from crowding out everyone else
 PRIORITY_MAX_PER_COMPANY = 8  # slightly higher cap for named brand-recognition pulls below
 TARGET_COUNT = 500
+INCREMENTAL_TARGET_COUNT = 30  # weekly incremental-mode target: genuinely new listings, not a re-seed
 
 # Well-known brands confirmed (by hand, via the API) to actually have current internship/entry
 # -level listings on The Muse - queried by name in addition to the category sampling below,
@@ -593,10 +605,12 @@ def is_recent(raw, max_age_days=MAX_POSTING_AGE_DAYS):
     return datetime.now(timezone.utc) - published <= timedelta(days=max_age_days)
 
 
-def _consider(raw, level, companies_by_name, seen_ids, company_counts, rows, max_per_company):
-    if len(rows) >= TARGET_COUNT:
+def _consider(raw, level, companies_by_name, seen_ids, company_counts, rows, max_per_company, target_count, existing_source_ids=None):
+    if len(rows) >= target_count:
         return False
     if raw["id"] in seen_ids:
+        return True
+    if existing_source_ids and str(raw["id"]) in existing_source_ids:
         return True
     company_name = raw.get("company", {}).get("name", "").strip()
     if not raw.get("name") or not company_name:
@@ -620,36 +634,43 @@ def _consider(raw, level, companies_by_name, seen_ids, company_counts, rows, max
     return True
 
 
-def main():
-    companies_by_name = load_companies()
-    print(f"Loaded {len(companies_by_name)} known companies for logo lookup")
-
+def collect_jobs(companies_by_name, target_count, company_counts=None, existing_source_ids=None):
+    """Runs the priority-companies pass then category sampling, stopping once target_count
+    rows are collected. Shared by both full-refresh (target_count=TARGET_COUNT, no existing_
+    source_ids) and incremental (target_count=INCREMENTAL_TARGET_COUNT, seeded with what's
+    already on the board so the per-company cap and dedup account for it) modes."""
     seen_ids = set()
-    company_counts = {}
+    company_counts = company_counts if company_counts is not None else {}
     rows = []
 
     print("-- priority brand-name companies --")
     for company in PRIORITY_COMPANIES:
+        if len(rows) >= target_count:
+            break
         for level in LEVELS:
             count_before = len(rows)
             for raw in fetch_query({"company": company, "level": level}, 3, f"company={company}"):
-                if not _consider(raw, level, companies_by_name, seen_ids, company_counts, rows, PRIORITY_MAX_PER_COMPANY):
+                if not _consider(raw, level, companies_by_name, seen_ids, company_counts, rows, PRIORITY_MAX_PER_COMPANY, target_count, existing_source_ids):
                     break
             print(f"'{company}' / '{level}': collected {len(rows) - count_before}")
 
     print("-- category sampling --")
     queries = [(level, category) for level in LEVELS for category in CATEGORIES]
-    random.shuffle(queries)  # avoid always exhausting the same early categories first as TARGET_COUNT is hit
+    random.shuffle(queries)  # avoid always exhausting the same early categories first as target_count is hit
 
     for level, category in queries:
-        if len(rows) >= TARGET_COUNT:
+        if len(rows) >= target_count:
             break
         count_before = len(rows)
         for raw in fetch_query({"level": level, "category": category}, PAGES_PER_QUERY, f"'{category}'/'{level}'"):
-            if not _consider(raw, level, companies_by_name, seen_ids, company_counts, rows, MAX_PER_COMPANY):
+            if not _consider(raw, level, companies_by_name, seen_ids, company_counts, rows, MAX_PER_COMPANY, target_count, existing_source_ids):
                 break
         print(f"'{category}' / '{level}': collected {len(rows) - count_before}")
 
+    return rows, company_counts
+
+
+def print_summary(rows, company_counts):
     print(f"Total listings to upsert: {len(rows)} across {len(company_counts)} distinct companies")
     with_logo = sum(1 for r in rows if r["logo_url"])
     print(f"  with matched real logo: {with_logo} ({with_logo * 100 // max(len(rows),1)}%)")
@@ -668,16 +689,64 @@ def main():
     top_companies = sorted(company_counts.items(), key=lambda kv: -kv[1])[:10]
     print(f"  top companies: {top_companies}")
 
-    conn = psycopg2.connect(os.environ["DATABASE_URL"])
+
+def full_refresh(conn, companies_by_name):
+    rows, company_counts = collect_jobs(companies_by_name, TARGET_COUNT)
+    print_summary(rows, company_counts)
+
     cur = conn.cursor()
-    # The per-company cap only means something against a full refresh - otherwise old
-    # over-represented rows from a prior run (e.g. 100+ Walmart listings) just sit alongside
-    # the new capped batch instead of being replaced by it.
-    cur.execute("DELETE FROM applications WHERE job_id IN (SELECT id FROM jobs WHERE source = 'themuse')")
-    cur.execute("DELETE FROM jobs WHERE source = 'themuse'")
+    cur.execute("SELECT id FROM jobs WHERE source = 'themuse'")
+    old_ids = [r[0] for r in cur.fetchall()]
+    if old_ids:
+        cur.execute("DELETE FROM applications WHERE job_id = ANY(%s)", (old_ids,))
+        cur.execute("DELETE FROM skill_gaps WHERE job_id = ANY(%s)", (old_ids,))
+        cur.execute("DELETE FROM scout_matches WHERE job_id = ANY(%s)", (old_ids,))
+        cur.execute("DELETE FROM jobs WHERE id = ANY(%s)", (old_ids,))
     conn.commit()
+
     n = upsert_jobs(conn, rows)
     print(f"Upserted {n} jobs")
+
+    try:
+        emails.send_ingest_report(ADMIN_EMAIL, n, rows, full_refresh=True)
+    except Exception as e:
+        print(f"Ingest report email error: {e}")
+
+
+def incremental_refresh(conn, companies_by_name):
+    cur = conn.cursor()
+    cur.execute("SELECT source_id FROM jobs WHERE source = 'themuse' AND source_id IS NOT NULL")
+    existing_source_ids = {row[0] for row in cur.fetchall()}
+    cur.execute("SELECT company, COUNT(*) FROM jobs WHERE source = 'themuse' GROUP BY company")
+    existing_company_counts = {company: count for company, count in cur.fetchall()}
+    print(f"{len(existing_source_ids)} listings already on the board across {len(existing_company_counts)} companies")
+
+    rows, company_counts = collect_jobs(
+        companies_by_name, INCREMENTAL_TARGET_COUNT,
+        company_counts=dict(existing_company_counts), existing_source_ids=existing_source_ids,
+    )
+    print_summary(rows, company_counts)
+
+    # Purely additive: candidates are pre-filtered against existing_source_ids, so upsert_jobs's
+    # ON CONFLICT DO UPDATE is just a harmless safety net here, never the common path.
+    n = upsert_jobs(conn, rows)
+    print(f"Upserted {n} new jobs")
+
+    try:
+        emails.send_ingest_report(ADMIN_EMAIL, n, rows, full_refresh=False)
+    except Exception as e:
+        print(f"Ingest report email error: {e}")
+
+
+def main():
+    companies_by_name = load_companies()
+    print(f"Loaded {len(companies_by_name)} known companies for logo lookup")
+
+    conn = psycopg2.connect(os.environ["DATABASE_URL"])
+    if "--full-refresh" in sys.argv:
+        full_refresh(conn, companies_by_name)
+    else:
+        incremental_refresh(conn, companies_by_name)
 
 
 if __name__ == "__main__":
