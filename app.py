@@ -293,6 +293,22 @@ def init_db():
             self_assessment TEXT,
             created_at TIMESTAMP DEFAULT NOW()
         );
+
+        CREATE TABLE IF NOT EXISTS negotiation_sessions (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            user_id UUID NOT NULL REFERENCES users(id),
+            company TEXT,
+            role_title TEXT,
+            level TEXT,
+            salary_offer TEXT,
+            location TEXT,
+            market_notes TEXT,
+            messages JSONB DEFAULT '[]',
+            debrief_summary JSONB,
+            status TEXT DEFAULT 'active',
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW()
+        );
     """)
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_matches_sent BOOLEAN DEFAULT FALSE;")
     cur.execute("ALTER TABLE post_comments ADD COLUMN IF NOT EXISTS parent_comment_id UUID REFERENCES post_comments(id);")
@@ -1122,6 +1138,7 @@ def delete_account(user_id):
         cur.execute("DELETE FROM profile_views WHERE viewer_id = %s OR viewed_user_id = %s", (user_id, user_id))
         cur.execute("DELETE FROM skill_gaps WHERE user_id = %s", (user_id,))
         cur.execute("DELETE FROM interview_debriefs WHERE user_id = %s", (user_id,))
+        cur.execute("DELETE FROM negotiation_sessions WHERE user_id = %s", (user_id,))
         cur.execute("DELETE FROM users WHERE id = %s", (user_id,))
         conn.commit()
 
@@ -3209,6 +3226,164 @@ def delete_debrief(debrief_id):
 
     if not deleted:
         return jsonify({"error": "debrief not found"}), 404
+    return jsonify({"status": "deleted"})
+
+
+# -----------------------------
+# NEGOTIATION COACH AGENT
+# -----------------------------
+# Same client-side-AI, backend-just-persists split as the other two agents. The chat itself
+# (a system-prompted hiring-manager role-play, turn by turn) and the end-of-session debrief
+# analysis both run through Gemini in the browser (createNegotiationChat()/
+# generateNegotiationDebrief() in geminiService.ts) - this only stores the resulting
+# transcript/debrief so a session survives a reload and shows up in the user's history. No FK
+# to jobs - the offer being negotiated may not even be one posted on Graduate.
+def _serialize_negotiation_session(r):
+    return {
+        "id": str(r['id']),
+        "company": r['company'],
+        "roleTitle": r['role_title'],
+        "level": r['level'],
+        "salaryOffer": r['salary_offer'],
+        "location": r['location'],
+        "marketNotes": r['market_notes'],
+        "messages": r['messages'] or [],
+        "debriefSummary": r['debrief_summary'],
+        "status": r['status'],
+        "createdAt": r['created_at'].isoformat() if r['created_at'] else None,
+        "updatedAt": r['updated_at'].isoformat() if r['updated_at'] else None,
+    }
+
+
+@app.post("/api/negotiate/session")
+@limiter.limit("20 per hour")
+def create_negotiation_session():
+    user_id = get_current_user()
+    if not user_id:
+        return jsonify({"error": "authentication required"}), 401
+
+    data = request.json or {}
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO negotiation_sessions (user_id, company, role_title, level, salary_offer, location, market_notes)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            RETURNING id, company, role_title, level, salary_offer, location, market_notes, messages, debrief_summary, status, created_at, updated_at
+        """, (user_id, data.get("company"), data.get("roleTitle"), data.get("level"), data.get("salaryOffer"), data.get("location"), data.get("marketNotes")))
+        result = cur.fetchone()
+        conn.commit()
+        return jsonify(_serialize_negotiation_session(result))
+
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        print(f"Error: {e}")
+        return jsonify({"error": "An unexpected error occurred."}), 500
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.patch("/api/negotiate/session/<session_id>")
+def update_negotiation_session(session_id):
+    user_id = get_current_user()
+    if not user_id:
+        return jsonify({"error": "authentication required"}), 401
+
+    data = request.json or {}
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT id FROM negotiation_sessions WHERE id = %s AND user_id = %s", (session_id, user_id))
+        if not cur.fetchone():
+            return jsonify({"error": "session not found"}), 404
+
+        fields, values = [], []
+        if "messages" in data:
+            fields.append("messages = %s")
+            values.append(Json(data["messages"]))
+        if "debriefSummary" in data:
+            fields.append("debrief_summary = %s")
+            values.append(Json(data["debriefSummary"]))
+        if "status" in data:
+            if data["status"] not in ("active", "completed"):
+                return jsonify({"error": "status must be active or completed"}), 400
+            fields.append("status = %s")
+            values.append(data["status"])
+
+        if not fields:
+            return jsonify({"error": "nothing to update"}), 400
+
+        fields.append("updated_at = NOW()")
+        values.extend([session_id, user_id])
+        cur.execute(f"UPDATE negotiation_sessions SET {', '.join(fields)} WHERE id = %s AND user_id = %s", values)
+        conn.commit()
+        return jsonify({"status": "updated"})
+
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        print(f"Error: {e}")
+        return jsonify({"error": "An unexpected error occurred."}), 500
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.get("/api/negotiate/session")
+def list_negotiation_sessions():
+    user_id = get_current_user()
+    if not user_id:
+        return jsonify({"error": "authentication required"}), 401
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, company, role_title, level, salary_offer, location, market_notes, messages, debrief_summary, status, created_at, updated_at
+        FROM negotiation_sessions WHERE user_id = %s ORDER BY updated_at DESC
+    """, (user_id,))
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return jsonify([_serialize_negotiation_session(r) for r in rows])
+
+
+@app.get("/api/negotiate/session/<session_id>")
+def get_negotiation_session(session_id):
+    user_id = get_current_user()
+    if not user_id:
+        return jsonify({"error": "authentication required"}), 401
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, company, role_title, level, salary_offer, location, market_notes, messages, debrief_summary, status, created_at, updated_at
+        FROM negotiation_sessions WHERE id = %s AND user_id = %s
+    """, (session_id, user_id))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    if not row:
+        return jsonify({"error": "session not found"}), 404
+    return jsonify(_serialize_negotiation_session(row))
+
+
+@app.delete("/api/negotiate/session/<session_id>")
+def delete_negotiation_session(session_id):
+    user_id = get_current_user()
+    if not user_id:
+        return jsonify({"error": "authentication required"}), 401
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM negotiation_sessions WHERE id = %s AND user_id = %s", (session_id, user_id))
+    deleted = cur.rowcount
+    conn.commit()
+    cur.close()
+    conn.close()
+    if not deleted:
+        return jsonify({"error": "session not found"}), 404
     return jsonify({"status": "deleted"})
 
 
