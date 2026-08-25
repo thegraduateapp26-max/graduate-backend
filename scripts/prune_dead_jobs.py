@@ -71,6 +71,7 @@ def main():
         dead_ids = [row["id"] for row in dead]
         cur.execute("DELETE FROM applications WHERE job_id = ANY(%s::uuid[])", (dead_ids,))
         cur.execute("DELETE FROM skill_gaps WHERE job_id = ANY(%s::uuid[])", (dead_ids,))
+        cur.execute("DELETE FROM scout_matches WHERE job_id = ANY(%s::uuid[])", (dead_ids,))
         cur.execute("DELETE FROM jobs WHERE id = ANY(%s::uuid[])", (dead_ids,))
         conn.commit()
         print(f"Removed {len(dead)} dead job listings (and their applications).")

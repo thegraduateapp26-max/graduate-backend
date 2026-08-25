@@ -309,6 +309,18 @@ def init_db():
             created_at TIMESTAMP DEFAULT NOW(),
             updated_at TIMESTAMP DEFAULT NOW()
         );
+
+        CREATE TABLE IF NOT EXISTS scout_matches (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            user_id UUID NOT NULL REFERENCES users(id),
+            job_id UUID NOT NULL REFERENCES jobs(id),
+            match_score INTEGER,
+            match_reasoning TEXT,
+            cover_letter_draft TEXT,
+            status TEXT DEFAULT 'new',
+            created_at TIMESTAMP DEFAULT NOW(),
+            UNIQUE (user_id, job_id)
+        );
     """)
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_matches_sent BOOLEAN DEFAULT FALSE;")
     cur.execute("ALTER TABLE post_comments ADD COLUMN IF NOT EXISTS parent_comment_id UUID REFERENCES post_comments(id);")
@@ -1139,6 +1151,7 @@ def delete_account(user_id):
         cur.execute("DELETE FROM skill_gaps WHERE user_id = %s", (user_id,))
         cur.execute("DELETE FROM interview_debriefs WHERE user_id = %s", (user_id,))
         cur.execute("DELETE FROM negotiation_sessions WHERE user_id = %s", (user_id,))
+        cur.execute("DELETE FROM scout_matches WHERE user_id = %s", (user_id,))
         cur.execute("DELETE FROM users WHERE id = %s", (user_id,))
         conn.commit()
 
@@ -3385,6 +3398,117 @@ def delete_negotiation_session(session_id):
     if not deleted:
         return jsonify({"error": "session not found"}), 404
     return jsonify({"status": "deleted"})
+
+
+# -----------------------------
+# SCOUT AGENT
+# -----------------------------
+# Adapted from the spec's "pull from an external job board API" design - Graduate already has
+# its own real, actively-pruned job board (see prune_dead_jobs.py), so Scout scores THOSE
+# listings against the user's profile instead of adding another rate-limited external API
+# dependency (Adzuna was already ruled out earlier in this project for exactly that reason).
+# Gemini scores the whole active board in one call (findJobMatches() in geminiService.ts) and
+# drafts a cover-letter opener for the best fits - backend just persists the result. Each
+# "Find My Matches" run replaces the user's prior batch outright rather than accumulating
+# stale matches against a board that changes weekly.
+@app.post("/api/scout/matches")
+@limiter.limit("10 per hour")
+def save_scout_matches():
+    user_id = get_current_user()
+    if not user_id:
+        return jsonify({"error": "authentication required"}), 401
+
+    data = request.json or {}
+    matches = data.get("matches") or []
+    if not isinstance(matches, list):
+        return jsonify({"error": "matches must be an array"}), 400
+
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("DELETE FROM scout_matches WHERE user_id = %s", (user_id,))
+        for m in matches:
+            job_id = m.get("jobId")
+            if not job_id:
+                continue
+            cur.execute("""
+                INSERT INTO scout_matches (user_id, job_id, match_score, match_reasoning, cover_letter_draft)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (user_id, job_id) DO NOTHING
+            """, (user_id, job_id, m.get("matchScore"), m.get("matchReasoning"), m.get("coverLetterDraft")))
+        conn.commit()
+        return jsonify({"status": "saved", "count": len(matches)})
+
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        print(f"Error: {e}")
+        return jsonify({"error": "An unexpected error occurred."}), 500
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.get("/api/scout/matches")
+def list_scout_matches():
+    user_id = get_current_user()
+    if not user_id:
+        return jsonify({"error": "authentication required"}), 401
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT sm.id, sm.job_id, sm.match_score, sm.match_reasoning, sm.cover_letter_draft, sm.status, sm.created_at,
+               j.title, j.company, j.location, j.logo_url, j.url
+        FROM scout_matches sm
+        JOIN jobs j ON j.id = sm.job_id
+        WHERE sm.user_id = %s AND j.is_active = TRUE
+        ORDER BY sm.match_score DESC NULLS LAST
+    """, (user_id,))
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    return jsonify([{
+        "id": str(r['id']),
+        "jobId": str(r['job_id']),
+        "matchScore": r['match_score'],
+        "matchReasoning": r['match_reasoning'],
+        "coverLetterDraft": r['cover_letter_draft'],
+        "status": r['status'],
+        "createdAt": r['created_at'].isoformat() if r['created_at'] else None,
+        "jobTitle": r['title'],
+        "jobCompany": r['company'],
+        "jobLocation": r['location'],
+        "jobLogoUrl": r['logo_url'],
+        "jobUrl": r['url'],
+    } for r in rows])
+
+
+@app.patch("/api/scout/matches/<job_id>")
+def update_scout_match(job_id):
+    user_id = get_current_user()
+    if not user_id:
+        return jsonify({"error": "authentication required"}), 401
+
+    data = request.json or {}
+    status = data.get("status")
+    if status not in ("new", "viewed", "applied", "dismissed"):
+        return jsonify({"error": "invalid status"}), 400
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE scout_matches SET status = %s WHERE user_id = %s AND job_id = %s",
+        (status, user_id, job_id),
+    )
+    updated = cur.rowcount
+    conn.commit()
+    cur.close()
+    conn.close()
+    if not updated:
+        return jsonify({"error": "match not found"}), 404
+    return jsonify({"status": "updated"})
 
 
 # -----------------------------
