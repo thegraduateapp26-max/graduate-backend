@@ -362,6 +362,11 @@ def init_db():
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_subscription_id TEXT;")
     cur.execute("ALTER TABLE applications ADD COLUMN IF NOT EXISTS confirmed BOOLEAN DEFAULT FALSE;")
     cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS jobs_source_source_id_idx ON jobs (source, source_id) WHERE source IS NOT NULL;")
+    # 'curated' = hand-picked in scripts/seed_scholarships.py, 'ai_search' = found by the weekly
+    # scripts/discover_scholarships.py cron. AI-found candidates whose application URL didn't
+    # verify are inserted with is_active = FALSE (source still 'ai_search') as a pending-review
+    # queue rather than shown live or silently dropped - see GET/PATCH /api/scholarships/pending.
+    cur.execute("ALTER TABLE scholarships ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'curated';")
     # One-time badge assignments (only applied if not already set, so a later admin
     # edit via the UI isn't silently reverted by a future deploy).
     cur.execute("UPDATE users SET custom_badge = %s WHERE name = %s AND custom_badge IS NULL;", ("CEO", "Gabrielle Branch"))
@@ -3608,6 +3613,64 @@ def delete_scholarship(scholarship_id):
         cur.execute("UPDATE scholarships SET is_active = FALSE WHERE id = %s", (scholarship_id,))
         conn.commit()
         return jsonify({"status": "deleted"})
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        print(f"Error: {e}")
+        return jsonify({"error": "An unexpected error occurred."}), 500
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+# -----------------------------
+# PENDING SCHOLARSHIPS (AI-discovered, URL didn't auto-verify)
+# -----------------------------
+@app.get("/api/scholarships/pending")
+def list_pending_scholarships():
+    user_id = get_current_user()
+    if not is_admin(user_id):
+        return jsonify({"error": "unauthorized"}), 401
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT id, title, provider, amount, deadline, description, url, tags, created_at
+        FROM scholarships
+        WHERE is_active = FALSE AND source = 'ai_search'
+        ORDER BY created_at DESC
+    """)
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    return jsonify([{
+        "id": str(r['id']),
+        "title": r['title'],
+        "provider": r['provider'],
+        "amount": r['amount'],
+        "deadline": r['deadline'].isoformat() if r['deadline'] else None,
+        "description": r['description'],
+        "url": r['url'],
+        "tags": r['tags'] or [],
+        "createdAt": r['created_at'].isoformat() if r['created_at'] else None,
+    } for r in rows])
+
+
+@app.patch("/api/scholarships/<scholarship_id>/approve")
+def approve_scholarship(scholarship_id):
+    user_id = get_current_user()
+    if not is_admin(user_id):
+        return jsonify({"error": "unauthorized"}), 401
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("UPDATE scholarships SET is_active = TRUE WHERE id = %s", (scholarship_id,))
+        conn.commit()
+        return jsonify({"status": "approved"})
     except Exception as e:
         sentry_sdk.capture_exception(e)
         print(f"Error: {e}")

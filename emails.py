@@ -315,6 +315,45 @@ def send_ingest_report(admin_email: str, new_count: int, new_jobs: list, full_re
     })
 
 
+def send_scholarship_report(admin_email: str, published: list, pending: list):
+    today = datetime.date.today().strftime("%B %d, %Y")
+
+    def _rows(items):
+        return "".join(f"""
+          <tr>
+            <td style="padding:8px 0; color:#0f172a; font-size:13px; font-weight:700; border-bottom:1px solid #f1f5f9;">{_esc(r['title'])}</td>
+            <td style="padding:8px 0; color:#64748b; font-size:13px; text-align:right; border-bottom:1px solid #f1f5f9;">{_esc(r['provider'])}</td>
+          </tr>
+        """ for r in items)
+
+    if published:
+        pub_body = f"""<h2 style="font-size:15px; color:#0f172a; margin:20px 0 4px;">Published ({len(published)})</h2>
+          <table style="width:100%; border-collapse:collapse;">{_rows(published)}</table>"""
+    else:
+        pub_body = """<p style="color:#64748b; font-size:14px; margin-top:12px;">No new scholarships found this run.</p>"""
+
+    if pending:
+        pending_body = f"""<h2 style="font-size:15px; color:#b45309; margin:20px 0 4px;">Needs review - application link didn't verify ({len(pending)})</h2>
+          <table style="width:100%; border-collapse:collapse;">{_rows(pending)}</table>
+          <p style="color:#94a3b8; font-size:12px; margin-top:8px;">Hidden from the app for now. Check each link and approve via PATCH /api/scholarships/&lt;id&gt;/approve, or leave it hidden if it's not real.</p>"""
+    else:
+        pending_body = ""
+
+    inner = f"""
+      <h1 style="font-size:22px; color:#0f172a; margin:0 0 4px;">Weekly Scholarship Discovery</h1>
+      <p style="color:#94a3b8; font-size:13px; margin:0 0 4px;">{today}</p>
+      <p style="color:#475569; font-size:14px; margin:12px 0 0;">Found {len(published)} new scholarship{'s' if len(published) != 1 else ''} with a verified application link, {len(pending)} more that need a manual look.</p>
+      {pub_body}
+      {pending_body}
+    """
+    return resend.Emails.send({
+        "from": FROM_EMAIL,
+        "to": admin_email,
+        "subject": f"Graduate: {len(published)} new scholarship{'s' if len(published) != 1 else ''} added, {len(pending)} pending review | {today}",
+        "html": _wrap(inner),
+    })
+
+
 def send_contact_notification(admin_email: str, name: str, sender_email: str, message: str):
     # Escaped like everything else here - this is fully public, unauthenticated user input.
     inner = f"""
