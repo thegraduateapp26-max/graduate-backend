@@ -35,6 +35,7 @@ def main():
         return
 
     cur.execute("DELETE FROM applications WHERE job_id = ANY(%s::uuid[])", (bad_ids,))
+    cur.execute("DELETE FROM skill_gaps WHERE job_id = ANY(%s::uuid[])", (bad_ids,))
     cur.execute("DELETE FROM jobs WHERE id = ANY(%s::uuid[])", (bad_ids,))
     conn.commit()
     print(f"\nRemoved {len(bad_ids)} jobs with unreliable apply links.")

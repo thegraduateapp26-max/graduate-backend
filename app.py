@@ -269,6 +269,18 @@ def init_db():
             viewed_user_id UUID NOT NULL REFERENCES users(id),
             created_at TIMESTAMP DEFAULT NOW()
         );
+
+        CREATE TABLE IF NOT EXISTS skill_gaps (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            user_id UUID NOT NULL REFERENCES users(id),
+            job_id UUID NOT NULL REFERENCES jobs(id),
+            matched_skills TEXT[] DEFAULT '{}',
+            missing_skills JSONB DEFAULT '[]',
+            skill_progress JSONB DEFAULT '{}',
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW(),
+            UNIQUE (user_id, job_id)
+        );
     """)
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_matches_sent BOOLEAN DEFAULT FALSE;")
     cur.execute("ALTER TABLE post_comments ADD COLUMN IF NOT EXISTS parent_comment_id UUID REFERENCES post_comments(id);")
@@ -1096,6 +1108,7 @@ def delete_account(user_id):
         cur.execute("DELETE FROM applications WHERE user_id = %s", (user_id,))
         cur.execute("DELETE FROM verification_requests WHERE user_id = %s", (user_id,))
         cur.execute("DELETE FROM profile_views WHERE viewer_id = %s OR viewed_user_id = %s", (user_id, user_id))
+        cur.execute("DELETE FROM skill_gaps WHERE user_id = %s", (user_id,))
         cur.execute("DELETE FROM users WHERE id = %s", (user_id,))
         conn.commit()
 
@@ -2881,6 +2894,199 @@ def my_applications():
             "jobType": r['job_type'],
         }
     } for r in rows])
+
+
+# -----------------------------
+# SKILL GAP AGENT
+# -----------------------------
+# The frontend runs the actual analysis (Gemini call comparing the user's profile against a
+# job's description - see services/geminiService.ts analyzeSkillGap()) and POSTs the
+# structured result here just to persist it. skill_progress is kept separate from
+# missing_skills so re-running the analysis (profile changed, job description changed) can
+# refresh the AI's findings without wiping out checkboxes the user has already ticked -
+# progress for a skill carries over if that skill is still listed as missing, and drops off
+# on its own if the skill isn't missing anymore.
+SKILL_STATUSES = ("not_started", "in_progress", "done")
+
+
+@app.post("/api/skill-gap")
+@limiter.limit("30 per hour")
+def save_skill_gap():
+    user_id = get_current_user()
+    if not user_id:
+        return jsonify({"error": "authentication required"}), 401
+
+    data = request.json or {}
+    job_id = data.get("jobId")
+    matched_skills = data.get("matchedSkills") or []
+    missing_skills = data.get("missingSkills") or []
+    if not job_id:
+        return jsonify({"error": "jobId is required"}), 400
+    if not isinstance(matched_skills, list) or not isinstance(missing_skills, list):
+        return jsonify({"error": "matchedSkills and missingSkills must be arrays"}), 400
+
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT id FROM jobs WHERE id = %s", (job_id,))
+        if not cur.fetchone():
+            return jsonify({"error": "job not found"}), 404
+
+        cur.execute("SELECT skill_progress FROM skill_gaps WHERE user_id = %s AND job_id = %s", (user_id, job_id))
+        existing = cur.fetchone()
+        prior_progress = existing['skill_progress'] if existing else {}
+
+        missing_skill_names = [m.get("skill") for m in missing_skills if isinstance(m, dict) and m.get("skill")]
+        carried_progress = {skill: prior_progress.get(skill, "not_started") for skill in missing_skill_names}
+
+        cur.execute("""
+            INSERT INTO skill_gaps (user_id, job_id, matched_skills, missing_skills, skill_progress, updated_at)
+            VALUES (%s, %s, %s, %s, %s, NOW())
+            ON CONFLICT (user_id, job_id) DO UPDATE SET
+                matched_skills = EXCLUDED.matched_skills,
+                missing_skills = EXCLUDED.missing_skills,
+                skill_progress = EXCLUDED.skill_progress,
+                updated_at = NOW()
+            RETURNING id, created_at, updated_at
+        """, (user_id, job_id, matched_skills, Json(missing_skills), Json(carried_progress)))
+
+        result = cur.fetchone()
+        conn.commit()
+
+        return jsonify({
+            "status": "saved",
+            "id": str(result['id']),
+            "jobId": job_id,
+            "matchedSkills": matched_skills,
+            "missingSkills": missing_skills,
+            "skillProgress": carried_progress,
+            "updatedAt": result['updated_at'].isoformat(),
+        })
+
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        print(f"Error: {e}")
+        return jsonify({"error": "An unexpected error occurred."}), 500
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.get("/api/skill-gap")
+def list_skill_gaps():
+    user_id = get_current_user()
+    if not user_id:
+        return jsonify({"error": "authentication required"}), 401
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT sg.id, sg.job_id, sg.matched_skills, sg.missing_skills, sg.skill_progress, sg.updated_at,
+               j.title, j.company, j.logo_url
+        FROM skill_gaps sg
+        JOIN jobs j ON j.id = sg.job_id
+        WHERE sg.user_id = %s
+        ORDER BY sg.updated_at DESC
+    """, (user_id,))
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    return jsonify([{
+        "id": str(r['id']),
+        "jobId": str(r['job_id']),
+        "jobTitle": r['title'],
+        "jobCompany": r['company'],
+        "jobLogoUrl": r['logo_url'],
+        "matchedSkills": r['matched_skills'] or [],
+        "missingSkills": r['missing_skills'] or [],
+        "skillProgress": r['skill_progress'] or {},
+        "updatedAt": r['updated_at'].isoformat() if r['updated_at'] else None,
+    } for r in rows])
+
+
+@app.get("/api/skill-gap/<job_id>")
+def get_skill_gap(job_id):
+    user_id = get_current_user()
+    if not user_id:
+        return jsonify({"error": "authentication required"}), 401
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, matched_skills, missing_skills, skill_progress, updated_at
+        FROM skill_gaps WHERE user_id = %s AND job_id = %s
+    """, (user_id, job_id))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+
+    if not row:
+        return jsonify({"error": "no analysis on file for this job"}), 404
+
+    return jsonify({
+        "id": str(row['id']),
+        "jobId": job_id,
+        "matchedSkills": row['matched_skills'] or [],
+        "missingSkills": row['missing_skills'] or [],
+        "skillProgress": row['skill_progress'] or {},
+        "updatedAt": row['updated_at'].isoformat() if row['updated_at'] else None,
+    })
+
+
+@app.patch("/api/skill-gap/<job_id>/skill")
+def update_skill_gap_progress(job_id):
+    user_id = get_current_user()
+    if not user_id:
+        return jsonify({"error": "authentication required"}), 401
+
+    data = request.json or {}
+    skill = data.get("skill")
+    status = data.get("status")
+    if not skill or status not in SKILL_STATUSES:
+        return jsonify({"error": f"skill is required and status must be one of {SKILL_STATUSES}"}), 400
+
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT skill_progress FROM skill_gaps WHERE user_id = %s AND job_id = %s", (user_id, job_id))
+        row = cur.fetchone()
+        if not row:
+            return jsonify({"error": "no analysis on file for this job"}), 404
+
+        progress = row['skill_progress'] or {}
+        progress[skill] = status
+        cur.execute(
+            "UPDATE skill_gaps SET skill_progress = %s, updated_at = NOW() WHERE user_id = %s AND job_id = %s",
+            (Json(progress), user_id, job_id),
+        )
+        conn.commit()
+        return jsonify({"status": "updated", "skillProgress": progress})
+
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        print(f"Error: {e}")
+        return jsonify({"error": "An unexpected error occurred."}), 500
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.delete("/api/skill-gap/<job_id>")
+def delete_skill_gap(job_id):
+    user_id = get_current_user()
+    if not user_id:
+        return jsonify({"error": "authentication required"}), 401
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM skill_gaps WHERE user_id = %s AND job_id = %s", (user_id, job_id))
+    conn.commit()
+    cur.close()
+    conn.close()
+    return jsonify({"status": "deleted"})
 
 
 # -----------------------------

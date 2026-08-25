@@ -67,6 +67,7 @@ def main():
         return
 
     cur.execute("DELETE FROM applications WHERE job_id = ANY(%s::uuid[])", (dead_ids,))
+    cur.execute("DELETE FROM skill_gaps WHERE job_id = ANY(%s::uuid[])", (dead_ids,))
     cur.execute("DELETE FROM jobs WHERE id = ANY(%s::uuid[])", (dead_ids,))
     conn.commit()
     print(f"Removed {len(dead_ids)} dead job listings (and their applications).")

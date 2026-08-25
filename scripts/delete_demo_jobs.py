@@ -25,6 +25,7 @@ for r in to_delete:
 ids = [r["id"] for r in to_delete]
 if ids:
     cur.execute("DELETE FROM applications WHERE job_id = ANY(%s::uuid[])", (ids,))
+    cur.execute("DELETE FROM skill_gaps WHERE job_id = ANY(%s::uuid[])", (ids,))
     print(f"Deleted {cur.rowcount} application(s) referencing demo jobs")
     cur.execute("DELETE FROM jobs WHERE id = ANY(%s::uuid[])", (ids,))
     conn.commit()
