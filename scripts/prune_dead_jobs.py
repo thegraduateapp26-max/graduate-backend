@@ -21,6 +21,10 @@ import psycopg2
 import psycopg2.extras
 import requests
 
+# emails.py lives one directory up (the repo root) - make this importable whether the script
+# is invoked as `python3 scripts/prune_dead_jobs.py` from the root or `python3
+# prune_dead_jobs.py` from within scripts/ itself.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import emails
 
 REQUEST_TIMEOUT = 10
