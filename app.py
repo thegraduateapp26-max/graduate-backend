@@ -281,6 +281,18 @@ def init_db():
             updated_at TIMESTAMP DEFAULT NOW(),
             UNIQUE (user_id, job_id)
         );
+
+        CREATE TABLE IF NOT EXISTS interview_debriefs (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            user_id UUID NOT NULL REFERENCES users(id),
+            company TEXT,
+            role_title TEXT,
+            reflection TEXT NOT NULL,
+            questions_asked TEXT[] DEFAULT '{}',
+            topics TEXT[] DEFAULT '{}',
+            self_assessment TEXT,
+            created_at TIMESTAMP DEFAULT NOW()
+        );
     """)
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_matches_sent BOOLEAN DEFAULT FALSE;")
     cur.execute("ALTER TABLE post_comments ADD COLUMN IF NOT EXISTS parent_comment_id UUID REFERENCES post_comments(id);")
@@ -1109,6 +1121,7 @@ def delete_account(user_id):
         cur.execute("DELETE FROM verification_requests WHERE user_id = %s", (user_id,))
         cur.execute("DELETE FROM profile_views WHERE viewer_id = %s OR viewed_user_id = %s", (user_id, user_id))
         cur.execute("DELETE FROM skill_gaps WHERE user_id = %s", (user_id,))
+        cur.execute("DELETE FROM interview_debriefs WHERE user_id = %s", (user_id,))
         cur.execute("DELETE FROM users WHERE id = %s", (user_id,))
         conn.commit()
 
@@ -3086,6 +3099,116 @@ def delete_skill_gap(job_id):
     conn.commit()
     cur.close()
     conn.close()
+    return jsonify({"status": "deleted"})
+
+
+# -----------------------------
+# INTERVIEW DEBRIEF AGENT
+# -----------------------------
+# Same split as the Skill Gap Agent: the frontend runs the actual Gemini extraction (turning
+# free-text reflection into structured questions/topics/self-assessment, and separately
+# synthesizing patterns across multiple debriefs into coaching feedback - see
+# extractDebriefDetails()/analyzeInterviewPatterns() in geminiService.ts), this just persists
+# results. company/role_title are stored as a plain text snapshot rather than an FK to
+# applications/jobs, so a debrief - meant to be a durable personal record - survives even if
+# the underlying job posting or application row is later deleted.
+@app.post("/api/debrief")
+@limiter.limit("30 per hour")
+def save_debrief():
+    user_id = get_current_user()
+    if not user_id:
+        return jsonify({"error": "authentication required"}), 401
+
+    data = request.json or {}
+    reflection = (data.get("reflection") or "").strip()
+    if not reflection:
+        return jsonify({"error": "reflection is required"}), 400
+    if len(reflection) > 8000:
+        return jsonify({"error": "reflection is too long (8000 characters max)"}), 400
+
+    questions_asked = data.get("questionsAsked") or []
+    topics = data.get("topics") or []
+    if not isinstance(questions_asked, list) or not isinstance(topics, list):
+        return jsonify({"error": "questionsAsked and topics must be arrays"}), 400
+
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO interview_debriefs (user_id, company, role_title, reflection, questions_asked, topics, self_assessment)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            RETURNING id, created_at
+        """, (user_id, data.get("company"), data.get("roleTitle"), reflection, questions_asked, topics, data.get("selfAssessment")))
+
+        result = cur.fetchone()
+        conn.commit()
+
+        return jsonify({
+            "status": "saved",
+            "id": str(result['id']),
+            "company": data.get("company"),
+            "roleTitle": data.get("roleTitle"),
+            "reflection": reflection,
+            "questionsAsked": questions_asked,
+            "topics": topics,
+            "selfAssessment": data.get("selfAssessment"),
+            "createdAt": result['created_at'].isoformat(),
+        })
+
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        print(f"Error: {e}")
+        return jsonify({"error": "An unexpected error occurred."}), 500
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.get("/api/debrief")
+def list_debriefs():
+    user_id = get_current_user()
+    if not user_id:
+        return jsonify({"error": "authentication required"}), 401
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, company, role_title, reflection, questions_asked, topics, self_assessment, created_at
+        FROM interview_debriefs WHERE user_id = %s ORDER BY created_at DESC
+    """, (user_id,))
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    return jsonify([{
+        "id": str(r['id']),
+        "company": r['company'],
+        "roleTitle": r['role_title'],
+        "reflection": r['reflection'],
+        "questionsAsked": r['questions_asked'] or [],
+        "topics": r['topics'] or [],
+        "selfAssessment": r['self_assessment'],
+        "createdAt": r['created_at'].isoformat() if r['created_at'] else None,
+    } for r in rows])
+
+
+@app.delete("/api/debrief/<debrief_id>")
+def delete_debrief(debrief_id):
+    user_id = get_current_user()
+    if not user_id:
+        return jsonify({"error": "authentication required"}), 401
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM interview_debriefs WHERE id = %s AND user_id = %s", (debrief_id, user_id))
+    deleted = cur.rowcount
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    if not deleted:
+        return jsonify({"error": "debrief not found"}), 404
     return jsonify({"status": "deleted"})
 
 
