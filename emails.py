@@ -257,6 +257,33 @@ def send_daily_analytics_email(to_email: str, stats: dict):
     })
 
 
+def send_prune_report(admin_email: str, checked: int, removed: list):
+    today = datetime.date.today().strftime("%B %d, %Y")
+    if removed:
+        rows = "".join(f"""
+          <tr>
+            <td style="padding:8px 0; color:#0f172a; font-size:13px; font-weight:700; border-bottom:1px solid #f1f5f9;">{_esc(r['title'])}</td>
+            <td style="padding:8px 0; color:#64748b; font-size:13px; text-align:right; border-bottom:1px solid #f1f5f9;">{_esc(r['company'])}</td>
+          </tr>
+        """ for r in removed)
+        body = f"""<table style="width:100%; border-collapse:collapse; margin-top:12px;">{rows}</table>"""
+    else:
+        body = """<p style="color:#64748b; font-size:14px; margin-top:12px;">Nothing to remove - every checked listing is still live.</p>"""
+
+    inner = f"""
+      <h1 style="font-size:22px; color:#0f172a; margin:0 0 4px;">Weekly Dead Job Cleanup</h1>
+      <p style="color:#94a3b8; font-size:13px; margin:0 0 4px;">{today}</p>
+      <p style="color:#475569; font-size:14px; margin:12px 0 0;">Checked {checked} job listing{'s' if checked != 1 else ''}, removed {len(removed)} that {'were' if len(removed) != 1 else 'was'} no longer live on the company's site.</p>
+      {body}
+    """
+    return resend.Emails.send({
+        "from": FROM_EMAIL,
+        "to": admin_email,
+        "subject": f"Graduate: {len(removed)} dead job listing{'s' if len(removed) != 1 else ''} removed | {today}",
+        "html": _wrap(inner),
+    })
+
+
 def send_contact_notification(admin_email: str, name: str, sender_email: str, message: str):
     # Escaped like everything else here - this is fully public, unauthenticated user input.
     inner = f"""

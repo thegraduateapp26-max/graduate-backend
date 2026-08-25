@@ -21,7 +21,10 @@ import psycopg2
 import psycopg2.extras
 import requests
 
+import emails
+
 REQUEST_TIMEOUT = 10
+ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "gabbybranch84@gmail.com")
 
 
 def is_dead(url):
@@ -41,39 +44,45 @@ def main():
     rows = cur.fetchall()
     print(f"Checking {len(rows)} job URLs...")
 
-    dead_ids = []
+    dead = []
     checked = 0
     for row in rows:
         checked += 1
         status = is_dead(row["url"])
         if status is True:
-            dead_ids.append(row["id"])
+            dead.append(row)
             print(f"  [{checked}/{len(rows)}] DEAD: {row['title'][:50]} @ {row['company']}")
         elif checked % 50 == 0:
             print(f"  [{checked}/{len(rows)}] ...")
 
-    print(f"\n{len(dead_ids)} dead out of {len(rows)} checked.")
-
-    if not dead_ids:
-        print("Nothing to remove.")
-        cur.close()
-        conn.close()
-        return
+    print(f"\n{len(dead)} dead out of {len(rows)} checked.")
 
     if dry_run:
-        print("Dry run - not deleting. Re-run without --dry-run to actually remove these.")
+        print("Dry run - not deleting or emailing. Re-run without --dry-run to actually remove these.")
         cur.close()
         conn.close()
         return
 
-    cur.execute("DELETE FROM applications WHERE job_id = ANY(%s::uuid[])", (dead_ids,))
-    cur.execute("DELETE FROM skill_gaps WHERE job_id = ANY(%s::uuid[])", (dead_ids,))
-    cur.execute("DELETE FROM jobs WHERE id = ANY(%s::uuid[])", (dead_ids,))
-    conn.commit()
-    print(f"Removed {len(dead_ids)} dead job listings (and their applications).")
+    if dead:
+        dead_ids = [row["id"] for row in dead]
+        cur.execute("DELETE FROM applications WHERE job_id = ANY(%s::uuid[])", (dead_ids,))
+        cur.execute("DELETE FROM skill_gaps WHERE job_id = ANY(%s::uuid[])", (dead_ids,))
+        cur.execute("DELETE FROM jobs WHERE id = ANY(%s::uuid[])", (dead_ids,))
+        conn.commit()
+        print(f"Removed {len(dead)} dead job listings (and their applications).")
+    else:
+        print("Nothing to remove.")
 
     cur.close()
     conn.close()
+
+    # Emailed every real run, dead listings or not - on a weekly unattended job, a "still all
+    # clear" report is what confirms the automation is actually running rather than silently
+    # having stopped.
+    try:
+        emails.send_prune_report(ADMIN_EMAIL, checked, dead)
+    except Exception as e:
+        print(f"Prune report email error: {e}")
 
 
 if __name__ == "__main__":
