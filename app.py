@@ -1966,7 +1966,7 @@ def list_user_connections(user_id):
     cur = conn.cursor()
 
     cur.execute("""
-        SELECT c.id, c.created_at,
+        SELECT c.id, c.created_at, c.requester_id,
                CASE WHEN c.requester_id = %s THEN c.recipient_id ELSE c.requester_id END AS other_id
         FROM connections c
         WHERE c.status = 'accepted' AND (c.requester_id = %s OR c.recipient_id = %s)
@@ -1988,6 +1988,10 @@ def list_user_connections(user_id):
                 "avatarUrl": u['avatar_url'],
                 "role": u['role'],
                 "connectedAt": r['created_at'].isoformat() if r['created_at'] else None,
+                # True when this user sent the original request - the frontend uses this to
+                # notify "X accepted your connection request" only for requests you initiated,
+                # not the ones where you were the one who clicked accept.
+                "initiatedByMe": str(r['requester_id']) == user_id,
             })
 
     cur.close()
@@ -2498,6 +2502,54 @@ def toggle_post_like(post_id):
     finally:
         cur.close()
         conn.close()
+
+
+# -----------------------------
+# MY POST ENGAGEMENT (for notifications - who liked/commented on posts you authored)
+# -----------------------------
+@app.get("/api/users/<user_id>/post-engagement")
+def list_post_engagement(user_id):
+    # Private, same as the connections list - only the post author sees who engaged.
+    current_user = get_current_user()
+    if not current_user or current_user != user_id:
+        return jsonify({"error": "unauthorized"}), 401
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT 'like' AS type, pl.post_id, p.content AS post_snippet,
+               u.id AS actor_id, u.name AS actor_name, u.avatar_url AS actor_avatar,
+               pl.created_at AS event_time
+        FROM post_likes pl
+        JOIN posts p ON p.id = pl.post_id
+        JOIN users u ON u.id = pl.user_id
+        WHERE p.author_id = %s AND pl.user_id != %s
+        UNION ALL
+        SELECT 'comment' AS type, pc.post_id, p.content AS post_snippet,
+               u.id AS actor_id, u.name AS actor_name, u.avatar_url AS actor_avatar,
+               pc.created_at AS event_time
+        FROM post_comments pc
+        JOIN posts p ON p.id = pc.post_id
+        JOIN users u ON u.id = pc.author_id
+        WHERE p.author_id = %s AND pc.author_id != %s
+        ORDER BY event_time DESC
+        LIMIT 20
+    """, (user_id, user_id, user_id, user_id))
+    rows = cur.fetchall()
+
+    cur.close()
+    conn.close()
+
+    return jsonify([{
+        "type": r["type"],
+        "postId": str(r["post_id"]),
+        "postSnippet": (r["post_snippet"] or "")[:80],
+        "actorId": str(r["actor_id"]),
+        "actorName": r["actor_name"],
+        "actorAvatarUrl": r["actor_avatar"],
+        "eventTime": r["event_time"].isoformat() if r["event_time"] else None,
+    } for r in rows])
 
 
 # -----------------------------
