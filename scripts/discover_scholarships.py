@@ -22,6 +22,7 @@ import datetime
 import json
 import os
 import sys
+import time
 
 import psycopg2
 import psycopg2.extras
@@ -67,10 +68,20 @@ SCHOLARSHIP_SCHEMA = {
 
 
 def _gemini_call(payload):
-    resp = requests.post(f"{GEMINI_URL}?key={GEMINI_API_KEY}", json=payload, timeout=60)
-    resp.raise_for_status()
-    data = resp.json()
-    return data["candidates"][0]["content"]["parts"][0]["text"]
+    # gemini-3-flash-preview in JSON-schema mode 503s under load fairly often in practice
+    # (confirmed transient - retries succeed within seconds), so this is worth a real retry
+    # loop rather than letting one blip fail the whole weekly run.
+    last_err = None
+    for attempt in range(4):
+        try:
+            resp = requests.post(f"{GEMINI_URL}?key={GEMINI_API_KEY}", json=payload, timeout=60)
+            resp.raise_for_status()
+            data = resp.json()
+            return data["candidates"][0]["content"]["parts"][0]["text"]
+        except requests.exceptions.RequestException as e:
+            last_err = e
+            time.sleep(5 * (attempt + 1))
+    raise last_err
 
 
 def generate_candidates(existing_titles):
