@@ -209,6 +209,14 @@ def init_db():
             created_at TIMESTAMP DEFAULT NOW()
         );
 
+        CREATE TABLE IF NOT EXISTS endorsement_requests (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            student_id UUID REFERENCES users(id) NOT NULL,
+            professor_id UUID REFERENCES users(id) NOT NULL,
+            message TEXT,
+            created_at TIMESTAMP DEFAULT NOW()
+        );
+
         CREATE TABLE IF NOT EXISTS posts (
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
             author_id UUID REFERENCES users(id) NOT NULL,
@@ -2186,7 +2194,7 @@ def list_endorsements(user_id):
 
     if current_user == user_id:
         cur.execute("""
-            SELECT e.id, e.relationship, e.text, e.visible, e.created_at,
+            SELECT e.id, e.author_id, e.relationship, e.text, e.visible, e.created_at,
                    u.name AS author_name, u.avatar_url AS author_avatar_url
             FROM endorsements e
             JOIN users u ON u.id = e.author_id
@@ -2195,7 +2203,7 @@ def list_endorsements(user_id):
         """, (user_id,))
     else:
         cur.execute("""
-            SELECT e.id, e.relationship, e.text, e.visible, e.created_at,
+            SELECT e.id, e.author_id, e.relationship, e.text, e.visible, e.created_at,
                    u.name AS author_name, u.avatar_url AS author_avatar_url
             FROM endorsements e
             JOIN users u ON u.id = e.author_id
@@ -2209,6 +2217,7 @@ def list_endorsements(user_id):
 
     return jsonify([{
         "id": str(r['id']),
+        "fromId": str(r['author_id']),
         "fromName": r['author_name'],
         "relationship": r['relationship'],
         "text": r['text'],
@@ -2246,6 +2255,10 @@ def create_endorsement(user_id):
         """, (user_id, author_id, data.get("relationship", "Professor"), text))
 
         result = cur.fetchone()
+
+        # Writing the endorsement fulfills any pending request the student made for it.
+        cur.execute("DELETE FROM endorsement_requests WHERE student_id = %s AND professor_id = %s", (user_id, author_id))
+
         conn.commit()
 
         cur.execute("SELECT name, avatar_url FROM users WHERE id = %s", (author_id,))
@@ -2255,6 +2268,7 @@ def create_endorsement(user_id):
             "status": "created",
             "endorsement": {
                 "id": str(result['id']),
+                "fromId": author_id,
                 "fromName": author_info['name'],
                 "relationship": result['relationship'],
                 "text": result['text'],
@@ -2301,6 +2315,119 @@ def update_endorsement(endorsement_id):
             return jsonify({"error": "not found or unauthorized"}), 404
 
         return jsonify({"status": "updated", "id": str(updated['id']), "visible": updated['visible']})
+
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        print(f"Error: {e}")
+        return jsonify({"error": "An unexpected error occurred."}), 500
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.post("/api/users/<professor_id>/endorsement-requests")
+@limiter.limit("20 per minute")
+def create_endorsement_request(professor_id):
+    student_id = get_current_user()
+    if not student_id:
+        return jsonify({"error": "authentication required"}), 401
+
+    message = (request.json or {}).get("message", "")
+    message = message.strip()[:500] if message else None
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("SELECT role FROM users WHERE id = %s", (professor_id,))
+        target = cur.fetchone()
+        if not target or target['role'] != 'professor':
+            return jsonify({"error": "can only request endorsements from professors"}), 400
+
+        cur.execute("SELECT role FROM users WHERE id = %s", (student_id,))
+        requester = cur.fetchone()
+        if not requester or requester['role'] == 'professor':
+            return jsonify({"error": "professors can't request endorsements"}), 403
+
+        cur.execute("SELECT id FROM endorsement_requests WHERE student_id = %s AND professor_id = %s", (student_id, professor_id))
+        if cur.fetchone():
+            return jsonify({"error": "you already have a pending request with this professor"}), 409
+
+        cur.execute("""
+            INSERT INTO endorsement_requests (student_id, professor_id, message)
+            VALUES (%s, %s, %s)
+            RETURNING id, created_at
+        """, (student_id, professor_id, message))
+        result = cur.fetchone()
+        conn.commit()
+
+        return jsonify({
+            "status": "created",
+            "request": {
+                "id": str(result['id']),
+                "createdAt": result['created_at'].isoformat() if result['created_at'] else None,
+            }
+        })
+
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        print(f"Error: {e}")
+        return jsonify({"error": "An unexpected error occurred."}), 500
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.get("/api/endorsement-requests")
+def list_endorsement_requests():
+    professor_id = get_current_user()
+    if not professor_id:
+        return jsonify({"error": "authentication required"}), 401
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT r.id, r.message, r.created_at,
+               u.id AS student_id, u.name AS student_name, u.avatar_url AS student_avatar_url, u.headline AS student_headline
+        FROM endorsement_requests r
+        JOIN users u ON u.id = r.student_id
+        WHERE r.professor_id = %s
+        ORDER BY r.created_at DESC
+    """, (professor_id,))
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    return jsonify([{
+        "id": str(r['id']),
+        "studentId": str(r['student_id']),
+        "studentName": r['student_name'],
+        "studentAvatarUrl": r['student_avatar_url'],
+        "studentHeadline": r['student_headline'],
+        "message": r['message'],
+        "createdAt": r['created_at'].isoformat() if r['created_at'] else None,
+    } for r in rows])
+
+
+@app.delete("/api/endorsement-requests/<request_id>")
+def decline_endorsement_request(request_id):
+    professor_id = get_current_user()
+    if not professor_id:
+        return jsonify({"error": "authentication required"}), 401
+
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("DELETE FROM endorsement_requests WHERE id = %s AND professor_id = %s RETURNING id", (request_id, professor_id))
+        deleted = cur.fetchone()
+        conn.commit()
+
+        if not deleted:
+            return jsonify({"error": "not found or unauthorized"}), 404
+
+        return jsonify({"status": "declined", "id": str(deleted['id'])})
 
     except Exception as e:
         sentry_sdk.capture_exception(e)
