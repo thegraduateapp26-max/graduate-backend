@@ -367,6 +367,13 @@ def init_db():
     # verify are inserted with is_active = FALSE (source still 'ai_search') as a pending-review
     # queue rather than shown live or silently dropped - see GET/PATCH /api/scholarships/pending.
     cur.execute("ALTER TABLE scholarships ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'curated';")
+    # Students/graduates can have multiple majors, each with its own degree level (e.g. a
+    # Bachelor's in Computer Science and a Master's in Data Science) - [{major, level}, ...].
+    # The legacy `major` column is kept in sync (space-joined list of majors) so the existing
+    # keyword-based job matching, AI prompt building, member directory, and job-alert filtering
+    # keep working unchanged; only the profile page itself reads `degrees` directly now.
+    # Professors don't use this field - their `major` column instead holds what they teach.
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS degrees JSONB DEFAULT '[]'::jsonb;")
     # One-time badge assignments (only applied if not already set, so a later admin
     # edit via the UI isn't silently reverted by a future deploy).
     cur.execute("UPDATE users SET custom_badge = %s WHERE name = %s AND custom_badge IS NULL;", ("CEO", "Gabrielle Branch"))
@@ -1327,7 +1334,7 @@ def list_users():
 
     cur.execute("""
         SELECT u.id, u.name, u.role, u.verification_status, u.headline, u.school,
-        u.major, u.location, u.avatar_url, u.background_url, u.bio, u.active_status,
+        u.major, u.degrees, u.location, u.avatar_url, u.background_url, u.bio, u.active_status,
         u.projects, u.custom_badge, u.skills, u.grad_year, u.expected_graduation_date, u.work_history, u.created_at,
         u.endorsements_hidden, u.is_premium,
         EXISTS(SELECT 1 FROM spotlights s WHERE s.user_id = u.id AND s.is_active = TRUE) AS has_spotlight
@@ -1351,6 +1358,7 @@ def list_users():
             "headline": r['headline'],
             "school": r['school'],
             "major": r['major'],
+            "degrees": r['degrees'] or [],
             "location": r['location'],
             "avatarUrl": r['avatar_url'],
             "backgroundUrl": r['background_url'],
@@ -1385,12 +1393,25 @@ def update_user(user_id):
     cur = conn.cursor()
 
     try:
+        # `degrees` (student/graduate multi-major + level) takes precedence over a raw `major`
+        # string when both are sent - the legacy `major` column is kept in sync as a space-joined
+        # list of majors so existing keyword-based job matching, the AI prompt builder, member
+        # directory, and job-alert filtering keep working unchanged. Professors don't send
+        # `degrees` at all - their `major` still gets set directly (repurposed as what they teach).
+        degrees_payload = data.get("degrees")
+        major_value = data.get("major")
+        if degrees_payload is not None:
+            major_value = " ".join(
+                (d.get("major") or "").strip() for d in degrees_payload if (d.get("major") or "").strip()
+            ) or None
+
         cur.execute("""
             UPDATE users SET
                 name = COALESCE(%s, name),
                 headline = COALESCE(%s, headline),
                 school = COALESCE(%s, school),
                 major = COALESCE(%s, major),
+                degrees = COALESCE(%s, degrees),
                 location = COALESCE(%s, location),
                 avatar_url = COALESCE(%s, avatar_url),
                 background_url = COALESCE(%s, background_url),
@@ -1402,13 +1423,14 @@ def update_user(user_id):
                 skills = COALESCE(%s, skills),
                 endorsements_hidden = COALESCE(%s, endorsements_hidden)
             WHERE id = %s
-            RETURNING id, name, email, role, headline, school, major, location,
+            RETURNING id, name, email, role, headline, school, major, degrees, location,
                 avatar_url, background_url, bio, active_status, projects, custom_badge, grad_year, work_history, skills, endorsements_hidden
         """, (
             data.get("name"),
             data.get("headline"),
             data.get("school"),
-            data.get("major"),
+            major_value,
+            Json(degrees_payload) if degrees_payload is not None else None,
             data.get("location"),
             data.get("avatarUrl"),
             data.get("backgroundUrl"),
