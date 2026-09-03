@@ -109,9 +109,13 @@ STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")
 # connection per request can't wedge other requests this way: a slow/stuck connect only ever
 # blocks the one request making it. connect_timeout bounds how long that can take.
 def get_conn():
-    return psycopg2.connect(
-        DATABASE_URL, cursor_factory=RealDictCursor, connect_timeout=5
-    )
+    # One retry on a transient connect failure (e.g. a momentary blip on the DB proxy) - this is
+    # a plain sequential retry in the calling thread, not a shared pool/lock, so it can't
+    # reproduce the wedged-worker failure mode described above.
+    try:
+        return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor, connect_timeout=5)
+    except psycopg2.OperationalError:
+        return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor, connect_timeout=5)
 
 
 # -----------------------------
@@ -2085,7 +2089,10 @@ def list_message_threads():
                    AND ((co.requester_id = %(me)s AND co.recipient_id = c.other_id)
                      OR (co.recipient_id = %(me)s AND co.requester_id = c.other_id))
                ) AS is_connected,
-               COALESCE((SELECT is_ceo FROM users WHERE id = c.last_sender_id), FALSE) AS last_message_from_ceo
+               -- Only true when the OTHER participant (not me) sent the last message and they're
+               -- the CEO - otherwise the CEO's own outgoing messages mislabel whoever she's
+               -- talking to as "the CEO" when she views her own inbox.
+               (c.last_sender_id = c.other_id AND COALESCE((SELECT is_ceo FROM users WHERE id = c.other_id), FALSE)) AS last_message_from_ceo
         FROM convo c
         JOIN users u ON u.id = c.other_id
         WHERE c.rn = 1
