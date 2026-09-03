@@ -2248,9 +2248,11 @@ def create_endorsement(user_id):
         if not author or author['role'] != 'professor':
             return jsonify({"error": "only professors can write endorsements"}), 403
 
+        # Starts hidden - the recipient decides whether to publish it to their profile,
+        # rather than it appearing immediately for anyone viewing them.
         cur.execute("""
             INSERT INTO endorsements (recipient_id, author_id, relationship, text, visible)
-            VALUES (%s, %s, %s, %s, TRUE)
+            VALUES (%s, %s, %s, %s, FALSE)
             RETURNING id, relationship, text, visible, created_at
         """, (user_id, author_id, data.get("relationship", "Professor"), text))
 
@@ -2315,6 +2317,35 @@ def update_endorsement(endorsement_id):
             return jsonify({"error": "not found or unauthorized"}), 404
 
         return jsonify({"status": "updated", "id": str(updated['id']), "visible": updated['visible']})
+
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        print(f"Error: {e}")
+        return jsonify({"error": "An unexpected error occurred."}), 500
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.delete("/api/endorsements/<endorsement_id>")
+def delete_endorsement(endorsement_id):
+    current_user = get_current_user()
+    if not current_user:
+        return jsonify({"error": "authentication required"}), 401
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("DELETE FROM endorsements WHERE id = %s AND recipient_id = %s RETURNING id", (endorsement_id, current_user))
+        deleted = cur.fetchone()
+        conn.commit()
+
+        if not deleted:
+            return jsonify({"error": "not found or unauthorized"}), 404
+
+        return jsonify({"status": "deleted", "id": str(deleted['id'])})
 
     except Exception as e:
         sentry_sdk.capture_exception(e)
