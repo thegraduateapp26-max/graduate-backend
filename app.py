@@ -366,6 +366,10 @@ def init_db():
     # will become the source of truth driven by Stripe subscription webhooks once billing is wired up,
     # but the column/gating logic underneath doesn't need to change when that happens.
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_premium BOOLEAN DEFAULT FALSE;")
+    # Founder-level flag, manually granted to exactly one account - browses without leaving a
+    # profile-view trace, messages anyone regardless of the connection/Premium gate, and her
+    # messages surface as a highlighted "from the CEO" notification for the recipient.
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_ceo BOOLEAN DEFAULT FALSE;")
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT;")
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_subscription_id TEXT;")
     cur.execute("ALTER TABLE applications ADD COLUMN IF NOT EXISTS confirmed BOOLEAN DEFAULT FALSE;")
@@ -502,6 +506,18 @@ def is_premium(user_id):
     cur.close()
     conn.close()
     return bool(row and row['is_premium'])
+
+
+def is_ceo(user_id):
+    if not user_id:
+        return False
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT is_ceo FROM users WHERE id = %s", (user_id,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return bool(row and row['is_ceo'])
 
 
 def are_connected(user_a, user_b):
@@ -1787,6 +1803,8 @@ def record_profile_view(user_id):
     viewer_id = get_current_user()
     if not viewer_id or viewer_id == user_id:
         return jsonify({"status": "skipped"})
+    if is_ceo(viewer_id):
+        return jsonify({"status": "skipped"})
 
     conn = get_conn()
     cur = conn.cursor()
@@ -2046,6 +2064,7 @@ def list_message_threads():
         WITH convo AS (
             SELECT
                 CASE WHEN sender_id = %(me)s THEN recipient_id ELSE sender_id END AS other_id,
+                sender_id AS last_sender_id,
                 text, created_at,
                 ROW_NUMBER() OVER (
                     PARTITION BY CASE WHEN sender_id = %(me)s THEN recipient_id ELSE sender_id END
@@ -2065,7 +2084,8 @@ def list_message_threads():
                    WHERE co.status = 'accepted'
                    AND ((co.requester_id = %(me)s AND co.recipient_id = c.other_id)
                      OR (co.recipient_id = %(me)s AND co.requester_id = c.other_id))
-               ) AS is_connected
+               ) AS is_connected,
+               COALESCE((SELECT is_ceo FROM users WHERE id = c.last_sender_id), FALSE) AS last_message_from_ceo
         FROM convo c
         JOIN users u ON u.id = c.other_id
         WHERE c.rn = 1
@@ -2084,6 +2104,7 @@ def list_message_threads():
         "timestamp": r['last_timestamp'].isoformat() if r['last_timestamp'] else None,
         "unread": r['unread'],
         "isConnected": bool(r['is_connected']),
+        "lastMessageFromCeo": bool(r['last_message_from_ceo']),
     } for r in rows])
 
 
@@ -2141,7 +2162,7 @@ def send_message(other_user_id):
     # Already-connected pairs and premium senders skip the check entirely, and replying to an
     # existing thread is always allowed (whoever started it already had permission to) so a
     # premium user messaging a free one doesn't leave the free user unable to reply.
-    if not is_premium(current_user) and not are_connected(current_user, other_user_id):
+    if not is_premium(current_user) and not is_ceo(current_user) and not are_connected(current_user, other_user_id):
         cur.execute("""
             SELECT 1 FROM messages
             WHERE (sender_id = %s AND recipient_id = %s) OR (sender_id = %s AND recipient_id = %s)
